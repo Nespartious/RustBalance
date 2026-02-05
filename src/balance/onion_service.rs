@@ -320,69 +320,39 @@ impl OnionService {
         target_host: &str,
         target_port: u16,
     ) -> Result<()> {
-        // Read the initial request to check if it's HTTP and needs Host rewriting
-        let mut buf = vec![0u8; 8192];
-        let n = client.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(()); // Client disconnected
-        }
-
-        let request_data = &buf[..n];
-
-        // Check if this looks like an HTTP request
-        let is_http = request_data.starts_with(b"GET ")
-            || request_data.starts_with(b"POST ")
-            || request_data.starts_with(b"HEAD ")
-            || request_data.starts_with(b"PUT ")
-            || request_data.starts_with(b"DELETE ")
-            || request_data.starts_with(b"PATCH ")
-            || request_data.starts_with(b"OPTIONS ")
-            || request_data.starts_with(b"CONNECT ");
-
-        if is_http {
-            // Rewrite Host header to target
-            let request_str = String::from_utf8_lossy(request_data);
-            let target_with_port = if target_port == 80 {
-                target_host.to_string()
-            } else {
-                format!("{}:{}", target_host, target_port)
-            };
-
-            // Log original request headers (first few lines)
-            let first_lines: Vec<&str> = request_str.lines().take(5).collect();
-            info!("Original request headers: {:?}", first_lines);
-
-            // Replace Host header (case-insensitive)
-            let modified = Self::rewrite_host_header(&request_str, &target_with_port);
-            
-            // Log modified request headers
-            let modified_lines: Vec<&str> = modified.lines().take(5).collect();
-            info!("Modified request headers: {:?}", modified_lines);
-            info!("Rewrote Host header to: {}", target_with_port);
-
-            // Send modified request to target
-            socks.write_all(modified.as_bytes()).await?;
+        let target_with_port = if target_port == 80 {
+            target_host.to_string()
         } else {
-            // Not HTTP, just forward raw
-            socks.write_all(request_data).await?;
-        }
+            format!("{}:{}", target_host, target_port)
+        };
 
-        // Now bidirectionally proxy the rest
-        let (mut client_read, mut client_write) = client.split();
-        let (mut socks_read, mut socks_write) = socks.split();
+        let (client_read, mut client_write) = client.split();
+        let (socks_read, mut socks_write) = socks.split();
 
-        let client_to_socks = tokio::io::copy(&mut client_read, &mut socks_write);
-        let socks_to_client = tokio::io::copy(&mut socks_read, &mut client_write);
+        // Wrap in BufReader for line-based reading
+        let mut client_reader = tokio::io::BufReader::new(client_read);
+        let mut socks_reader = tokio::io::BufReader::new(socks_read);
+
+        // Spawn task to forward requests client -> server with Host rewriting
+        let target_for_task = target_with_port.clone();
+        let request_forwarder = async move {
+            Self::forward_requests_with_rewrite(&mut client_reader, &mut socks_write, &target_for_task).await
+        };
+
+        // Spawn task to forward responses server -> client (no modification needed)
+        let response_forwarder = async move {
+            Self::forward_responses(&mut socks_reader, &mut client_write).await
+        };
 
         tokio::select! {
-            result = client_to_socks => {
+            result = request_forwarder => {
                 if let Err(e) = result {
-                    debug!("Client to SOCKS copy error: {}", e);
+                    debug!("Request forwarder error: {}", e);
                 }
             }
-            result = socks_to_client => {
+            result = response_forwarder => {
                 if let Err(e) = result {
-                    debug!("SOCKS to client copy error: {}", e);
+                    debug!("Response forwarder error: {}", e);
                 }
             }
         }
@@ -390,30 +360,109 @@ impl OnionService {
         Ok(())
     }
 
-    /// Rewrite the Host header in an HTTP request
-    fn rewrite_host_header(request: &str, new_host: &str) -> String {
-        let mut result = String::with_capacity(request.len() + new_host.len());
-        let mut host_replaced = false;
+    /// Forward HTTP requests from client to server, rewriting Host header for each request
+    async fn forward_requests_with_rewrite<R, W>(
+        reader: &mut tokio::io::BufReader<R>,
+        writer: &mut W,
+        target_host: &str,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        for line in request.split("\r\n") {
-            if !result.is_empty() {
-                result.push_str("\r\n");
+        loop {
+            // Read the request line
+            let mut request_line = String::new();
+            let n = reader.read_line(&mut request_line).await?;
+            if n == 0 {
+                return Ok(()); // Connection closed
             }
 
-            // Check for Host header (case-insensitive)
-            if !host_replaced && line.len() > 5 {
-                let lower = line.to_lowercase();
+            // Check if this is an HTTP request
+            let is_http = request_line.starts_with("GET ")
+                || request_line.starts_with("POST ")
+                || request_line.starts_with("HEAD ")
+                || request_line.starts_with("PUT ")
+                || request_line.starts_with("DELETE ")
+                || request_line.starts_with("PATCH ")
+                || request_line.starts_with("OPTIONS ")
+                || request_line.starts_with("CONNECT ");
+
+            if !is_http {
+                // Not HTTP, just forward and continue
+                writer.write_all(request_line.as_bytes()).await?;
+                // Copy rest of data raw
+                tokio::io::copy(reader, writer).await?;
+                return Ok(());
+            }
+
+            // Write request line
+            writer.write_all(request_line.as_bytes()).await?;
+
+            // Read and process headers
+            let mut content_length: usize = 0;
+            loop {
+                let mut header_line = String::new();
+                let n = reader.read_line(&mut header_line).await?;
+                if n == 0 {
+                    return Ok(()); // Connection closed
+                }
+
+                // Check for end of headers
+                if header_line == "\r\n" || header_line == "\n" {
+                    writer.write_all(header_line.as_bytes()).await?;
+                    break;
+                }
+
+                // Check for Host header and rewrite it
+                let lower = header_line.to_lowercase();
                 if lower.starts_with("host:") {
-                    result.push_str(&format!("Host: {}", new_host));
-                    host_replaced = true;
-                    continue;
+                    let new_header = format!("Host: {}\r\n", target_host);
+                    debug!("Rewrote Host header to: {}", target_host);
+                    writer.write_all(new_header.as_bytes()).await?;
+                } else {
+                    // Check for Content-Length
+                    if lower.starts_with("content-length:") {
+                        if let Some(len_str) = header_line.split(':').nth(1) {
+                            content_length = len_str.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    writer.write_all(header_line.as_bytes()).await?;
                 }
             }
 
-            result.push_str(line);
-        }
+            writer.flush().await?;
 
-        result
+            // Forward request body if present
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                use tokio::io::AsyncReadExt;
+                reader.read_exact(&mut body_buf).await?;
+                writer.write_all(&body_buf).await?;
+                writer.flush().await?;
+            }
+
+            // Continue to next request on this connection (HTTP/1.1 keep-alive)
+        }
+    }
+
+    /// Forward responses from server to client without modification
+    async fn forward_responses<R, W>(
+        reader: &mut tokio::io::BufReader<R>,
+        writer: &mut W,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
+        // Just copy everything - responses don't need modification
+        tokio::io::copy(reader, writer).await?;
+        writer.flush().await?;
+        Ok(())
     }
 }
 
