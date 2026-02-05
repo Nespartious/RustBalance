@@ -921,22 +921,22 @@ wait_for_hidden_service() {
             continue
         fi
         
-        # Try to connect via torsocks/curl if available
-        if command -v torsocks &>/dev/null && command -v curl &>/dev/null; then
+        # Try to connect via curl with SOCKS5 proxy (more reliable than torsocks)
+        if command -v curl &>/dev/null; then
             echo -e "  [${ELAPSED}s] Testing connection to $ONION_ADDRESS..."
-            if timeout 30 torsocks curl -s --max-time 25 "http://$ONION_ADDRESS/" > /dev/null 2>&1; then
+            if timeout 30 curl -s --socks5-hostname 127.0.0.1:9050 --max-time 25 "http://$ONION_ADDRESS/" > /dev/null 2>&1; then
                 echo ""
                 echo -e "${GREEN}✓ HIDDEN SERVICE IS LIVE AND REACHABLE!${NC}"
                 echo ""
                 return 0
             fi
         else
-            # Without torsocks, just check if Tor reports the HS as published
+            # Without curl, just check if Tor reports the HS as published
             # by checking the logs for "Uploaded rendezvous descriptor"
             if sudo journalctl -u tor@default --since "5 minutes ago" 2>/dev/null | grep -q "Uploaded rendezvous descriptor"; then
                 echo ""
                 echo -e "${GREEN}✓ HIDDEN SERVICE DESCRIPTOR PUBLISHED!${NC}"
-                echo -e "${YELLOW}Note: Install torsocks for connectivity verification${NC}"
+                echo -e "${YELLOW}Note: Install curl for connectivity verification${NC}"
                 echo ""
                 return 0
             fi
@@ -962,7 +962,7 @@ wait_for_hidden_service() {
     echo ""
     echo -e "${YELLOW}⚠ Timeout waiting for hidden service to become reachable${NC}"
     echo "This may be normal - Tor hidden services can take several minutes to propagate."
-    echo "Check manually with: torsocks curl http://$ONION_ADDRESS/"
+    echo "Check manually with: curl --socks5-hostname 127.0.0.1:9050 http://$ONION_ADDRESS/"
     echo ""
     return 1
 }
