@@ -1,5 +1,21 @@
 # RustBalance - AI Assistant Instructions
 
+## ⚠️ CRITICAL: Git Author Rule
+
+**All commits to this repository MUST be authored by `nespartious`.**
+
+Before any git commit, verify:
+```
+git config user.name   # Must be: nespartious
+git config user.email  # Must be: nespartious@users.noreply.github.com
+```
+
+If the author is anything other than `nespartious`, **STOP and alert the user immediately**.
+
+A pre-commit hook is installed to enforce this, but always verify before committing.
+
+---
+
 ## Terminology
 
 | Term | Meaning |
