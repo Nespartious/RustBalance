@@ -348,9 +348,17 @@ impl OnionService {
                 format!("{}:{}", target_host, target_port)
             };
 
+            // Log original request headers (first few lines)
+            let first_lines: Vec<&str> = request_str.lines().take(5).collect();
+            info!("Original request headers: {:?}", first_lines);
+
             // Replace Host header (case-insensitive)
             let modified = Self::rewrite_host_header(&request_str, &target_with_port);
-            debug!("Rewriting Host header to {}", target_with_port);
+            
+            // Log modified request headers
+            let modified_lines: Vec<&str> = modified.lines().take(5).collect();
+            info!("Modified request headers: {:?}", modified_lines);
+            info!("Rewrote Host header to: {}", target_with_port);
 
             // Send modified request to target
             socks.write_all(modified.as_bytes()).await?;
