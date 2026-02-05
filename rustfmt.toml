@@ -1,0 +1,21 @@
+# Rust formatting configuration
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+
+# These require nightly - commented out for stable compatibility
+# imports_granularity = "Module"
+# group_imports = "StdExternalCrate"
+# format_code_in_doc_comments = true
+# doc_comment_code_block_width = 80
+# normalize_doc_attributes = true
+
+reorder_imports = true
+
+# Error handling style
+use_try_shorthand = true
+
+# Keep match arms clean
+match_block_trailing_comma = true

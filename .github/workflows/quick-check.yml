@@ -1,0 +1,25 @@
+name: Quick Check
+
+# Runs on PRs and manual trigger
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quick:
+    name: Quick Compile Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --all-features
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --all-features

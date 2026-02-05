@@ -1,0 +1,48 @@
+[node]
+id = "node-1"
+priority = 10
+clock_skew_tolerance_secs = 5
+
+[master]
+onion_address = "4m3tjcd2bue2xxzuodfjqombjnmbhyuyityf72x7ayeyth4m4yzr5nad.onion"
+identity_key_path = "/etc/rustbalance/master.key"
+
+[tor]
+control_host = "127.0.0.1"
+control_port = 9051
+socks_port = 9050
+
+[publish]
+refresh_interval_secs = 600
+takeover_grace_secs = 90
+max_intro_points = 20
+
+[health]
+descriptor_max_age_secs = 900
+http_probe_enabled = false
+http_probe_path = "/health"
+http_probe_timeout_secs = 5
+
+[coordination]
+mode = "wireguard"
+heartbeat_interval_secs = 10
+heartbeat_timeout_secs = 30
+lease_duration_secs = 60
+backoff_jitter_secs = 15
+
+[wireguard]
+interface = "wg0"
+listen_port = 51820
+
+[[wireguard.peers]]
+id = "node-2"
+endpoint = "192.168.40.143:51820"
+public_key = "VM2_WIREGUARD_PUBLIC_KEY=="
+
+[[backends]]
+name = "backend-1"
+onion_address = "esnymppkuwdhwam6vzthfvtl2i2y64rwwyt23gp63xmctndqp5tvgaad.onion"
+
+[[backends]]
+name = "backend-2"
+onion_address = "kze4sqyuoxexqmgi2i4pa7vqwz6f4cokub532zxqz45hyzzfvumiciyd.onion"

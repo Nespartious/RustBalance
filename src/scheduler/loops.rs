@@ -1,0 +1,851 @@
+//! Main scheduler loops
+
+use crate::balance::onion_service::NodeInfo;
+use crate::balance::{BootstrapClient, OnionService, Publisher};
+use crate::config::Config;
+use crate::coord::{CoordMessage, Coordinator, KnownPeerInfo, MessageType, PeerTracker};
+use crate::state::RuntimeState;
+use crate::tor::TorController;
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::time::{interval, Duration};
+use tracing::{debug, error, info, warn};
+
+/// Run the main scheduler
+pub async fn run(
+    config: Config,
+    state: RuntimeState,
+    _tor: TorController,
+    coordinator: Coordinator,
+) -> Result<()> {
+    let state = Arc::new(RwLock::new(state));
+    let coordinator = Arc::new(RwLock::new(coordinator));
+
+    // Initialize election with our config
+    {
+        let mut coord = coordinator.write().await;
+        coord.election_mut().init(
+            config.node.id.clone(),
+            config.node.priority,
+            config.coordination.heartbeat_timeout_secs,
+            config.publish.takeover_grace_secs,
+        );
+    }
+
+    // Determine if this is a joining node (has pre-configured peers)
+    let has_configured_peers = config
+        .wireguard
+        .as_ref()
+        .map(|wg| !wg.peers.is_empty())
+        .unwrap_or(false);
+
+    // Setup hidden service directory with master key (files only)
+    info!("Setting up hidden service directory...");
+    crate::balance::onion_service::setup_hs_directory(
+        &config.hidden_service_dir,
+        &config.master.identity_key_path,
+    )
+    .await?;
+
+    // Create onion service manager
+    let mut onion_service = OnionService::new(&config);
+
+    // For INIT nodes: Configure Tor HS immediately
+    // For JOINING nodes: Delay HS config until after bootstrap (to avoid self-connection)
+    if has_configured_peers {
+        info!("Joining node: Delaying HS config until after bootstrap");
+    } else {
+        info!("Init node: Configuring Tor hidden service...");
+        onion_service
+            .configure_tor_hs(&config.hidden_service_dir, 80)
+            .await?;
+
+        // Wait for Tor to create hostname file
+        info!("Waiting for Tor to initialize hidden service...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Read and verify hostname
+        match crate::balance::onion_service::read_hs_hostname(&config.hidden_service_dir).await {
+            Ok(hostname) => {
+                info!("Hidden service hostname: {}", hostname);
+                if hostname != config.master.onion_address {
+                    warn!(
+                        "Hostname mismatch! Expected: {}, Got: {}",
+                        config.master.onion_address, hostname
+                    );
+                }
+            },
+            Err(e) => {
+                error!("Failed to read hostname: {}", e);
+            },
+        }
+
+        // Mark HS as running
+        {
+            let mut state = state.write().await;
+            state.hs_running = true;
+        }
+    }
+
+    // Auto-detect mode: WireGuard always runs, mode determined by peer presence
+    // This allows seamless transition from single-node to multi-node
+    let has_wg_config = config.wireguard.is_some();
+
+    // Create shared peer tracker for join handling
+    let peer_tracker = Arc::new(RwLock::new(PeerTracker::new(
+        config.coordination.heartbeat_interval_secs,
+        3, // dead_threshold: mark peer dead after 3 missed heartbeats
+    )));
+
+    // Enable join handler if we have join_secret configured (Node 1 accepts join requests)
+    if let (Some(ref _join_secret), Some(ref wg_config)) =
+        (&config.coordination.join_secret, &config.wireguard)
+    {
+        if let (Some(ref pubkey), Some(ref endpoint), Some(ref tunnel_ip)) = (
+            &wg_config.public_key,
+            &wg_config.external_endpoint,
+            &wg_config.tunnel_ip,
+        ) {
+            info!("Enabling Tor Bootstrap Channel join handler");
+            let node_info = NodeInfo {
+                node_id: config.node.id.clone(),
+                wg_pubkey: pubkey.clone(),
+                wg_endpoint: endpoint.clone(),
+                tunnel_ip: tunnel_ip.clone(),
+            };
+            onion_service.enable_join_handler(
+                Arc::clone(&peer_tracker),
+                node_info,
+                Arc::clone(&coordinator),
+            );
+        }
+    }
+
+    if has_wg_config {
+        info!("WireGuard configured - coordination layer active, auto-detect mode enabled");
+        // In auto-detect mode, we start as standby and check for peers dynamically
+        // If no peers are active, we auto-become publisher
+    } else {
+        info!("No WireGuard config - pure single-node mode, auto-becoming publisher");
+        // No coordination possible, become publisher immediately
+        {
+            let mut coord = coordinator.write().await;
+            coord.election_mut().become_publisher();
+        }
+    }
+
+    // For JOINING nodes: Bootstrap via Tor BEFORE configuring HS
+    // This prevents the node from connecting to itself (since HS isn't published yet)
+    if has_configured_peers {
+        info!("Joining node: Attempting bootstrap via Tor (before HS config)...");
+
+        // Wait a bit for Tor to establish circuits
+        info!("Waiting 30 seconds for Tor circuits to establish...");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        // Try bootstrap synchronously (max 5 attempts)
+        let bootstrap_result = initial_bootstrap(&coordinator, &config).await;
+
+        match bootstrap_result {
+            Ok(true) => {
+                info!("Bootstrap successful! WireGuard mesh established.");
+            },
+            Ok(false) => {
+                warn!("Bootstrap completed but no peers added. Proceeding anyway.");
+            },
+            Err(e) => {
+                warn!("Bootstrap failed: {}. Proceeding to single-node mode.", e);
+            },
+        }
+
+        // NOW configure the hidden service (after bootstrap attempt)
+        info!("Joining node: NOW configuring Tor hidden service...");
+        onion_service
+            .configure_tor_hs(&config.hidden_service_dir, 80)
+            .await?;
+
+        // Wait for Tor to create hostname file
+        info!("Waiting for Tor to initialize hidden service...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Read and verify hostname
+        match crate::balance::onion_service::read_hs_hostname(&config.hidden_service_dir).await {
+            Ok(hostname) => {
+                info!("Hidden service hostname: {}", hostname);
+                if hostname != config.master.onion_address {
+                    warn!(
+                        "Hostname mismatch! Expected: {}, Got: {}",
+                        config.master.onion_address, hostname
+                    );
+                }
+            },
+            Err(e) => {
+                error!("Failed to read hostname: {}", e);
+            },
+        }
+
+        // Mark HS as running
+        {
+            let mut state = state.write().await;
+            state.hs_running = true;
+        }
+    }
+
+    // Spawn tasks
+    let coord_clone = Arc::clone(&coordinator);
+    let state_clone = Arc::clone(&state);
+    let config_clone = config.clone();
+    let heartbeat_handle = if has_wg_config {
+        Some(tokio::spawn(async move {
+            heartbeat_loop(coord_clone, state_clone, config_clone).await
+        }))
+    } else {
+        None
+    };
+
+    let coord_clone = Arc::clone(&coordinator);
+    let config_clone = config.clone();
+    let receive_handle = if has_wg_config {
+        Some(tokio::spawn(async move {
+            receive_loop(coord_clone, config_clone).await
+        }))
+    } else {
+        None
+    };
+
+    let state_clone = Arc::clone(&state);
+    let coord_clone = Arc::clone(&coordinator);
+    let config_clone = config.clone();
+    let publish_handle =
+        tokio::spawn(async move { publish_loop(state_clone, coord_clone, config_clone).await });
+
+    // Intro point refresh loop - periodically fetches our intro points from Tor
+    let state_clone = Arc::clone(&state);
+    let config_clone = config.clone();
+    let intro_point_handle =
+        tokio::spawn(async move { intro_point_refresh_loop(state_clone, config_clone).await });
+
+    // Run the reverse proxy (blocking)
+    let proxy_handle = tokio::spawn(async move { onion_service.run_proxy().await });
+
+    // Background bootstrap loop only for joining nodes (in case initial bootstrap failed)
+    // This continues checking for peers even after initial attempt
+    let coord_clone = Arc::clone(&coordinator);
+    let config_clone = config.clone();
+    let bootstrap_handle =
+        if has_wg_config && config.coordination.join_secret.is_some() && has_configured_peers {
+            // Note: Initial bootstrap already happened above, this is for ongoing checks
+            Some(tokio::spawn(async move {
+                background_bootstrap_loop(coord_clone, config_clone).await
+            }))
+        } else if has_wg_config && !has_configured_peers {
+            info!("Bootstrap loop disabled - this is the init node (no pre-configured peers)");
+            None
+        } else {
+            None
+        };
+
+    // Wait for any task to fail
+    tokio::select! {
+        r = publish_handle => {
+            error!("Publish loop exited: {:?}", r);
+        }
+        r = proxy_handle => {
+            error!("Proxy loop exited: {:?}", r);
+        }
+        r = intro_point_handle => {
+            error!("Intro point refresh loop exited: {:?}", r);
+        }
+        r = async {
+            if let Some(h) = heartbeat_handle { h.await } else { std::future::pending().await }
+        } => {
+            error!("Heartbeat loop exited: {:?}", r);
+        }
+        r = async {
+            if let Some(h) = bootstrap_handle { h.await } else { std::future::pending().await }
+        } => {
+            error!("Bootstrap loop exited: {:?}", r);
+        }
+        r = async {
+            if let Some(h) = receive_handle { h.await } else { std::future::pending().await }
+        } => {
+            error!("Receive loop exited: {:?}", r);
+        }
+    }
+
+    Ok(())
+}
+
+/// Heartbeat loop - sends periodic heartbeats with peer gossip
+async fn heartbeat_loop(
+    coordinator: Arc<RwLock<Coordinator>>,
+    state: Arc<RwLock<RuntimeState>>,
+    config: Config,
+) -> Result<()> {
+    let mut ticker = interval(Duration::from_secs(
+        config.coordination.heartbeat_interval_secs,
+    ));
+
+    // Build our own peer info for gossip (so others can discover us)
+    let our_info = config.wireguard.as_ref().and_then(|wg| {
+        match (&wg.public_key, &wg.external_endpoint, &wg.tunnel_ip) {
+            (Some(pubkey), Some(endpoint), Some(tunnel_ip)) => Some(KnownPeerInfo {
+                node_id: config.node.id.clone(),
+                wg_pubkey: pubkey.clone(),
+                wg_endpoint: endpoint.clone(),
+                tunnel_ip: tunnel_ip.clone(),
+            }),
+            _ => None,
+        }
+    });
+
+    loop {
+        ticker.tick().await;
+
+        let (role, mut known_peers, intro_point_count) = {
+            let coord = coordinator.read().await;
+            let role = coord.election().role();
+            // Gather known peers for gossip
+            let known_peers = coord.peers().get_known_peer_infos();
+
+            // Get our intro point count
+            let state = state.read().await;
+            let intro_count = state.own_intro_points.len();
+
+            (role, known_peers, intro_count)
+        };
+
+        // Include ourselves in the gossip so peers can discover our info
+        if let Some(ref our) = our_info {
+            if !known_peers.iter().any(|p| p.node_id == our.node_id) {
+                known_peers.push(our.clone());
+            }
+        }
+
+        let msg = CoordMessage::heartbeat(
+            config.node.id.clone(),
+            role,
+            None, // TODO: track last publish time
+            known_peers,
+            intro_point_count,
+        );
+
+        let coord = coordinator.read().await;
+        if let Err(e) = coord.broadcast(&msg).await {
+            warn!("Failed to send heartbeat: {}", e);
+        }
+    }
+}
+
+/// Receive loop - processes incoming coordination messages
+async fn receive_loop(coordinator: Arc<RwLock<Coordinator>>, config: Config) -> Result<()> {
+    loop {
+        // Get the receive future with a timeout so we don't block forever
+        // This allows other tasks to acquire locks
+        let recv_result = {
+            let coord = coordinator.read().await;
+            tokio::time::timeout(Duration::from_millis(100), coord.receive()).await
+        };
+
+        match recv_result {
+            Ok(Ok(msg)) => {
+                if !msg.is_valid_time(config.node.clock_skew_tolerance_secs) {
+                    warn!(
+                        "Rejecting message with invalid timestamp from {}",
+                        msg.node_id
+                    );
+                    continue;
+                }
+
+                // Handle different message types
+                match &msg.message {
+                    MessageType::Heartbeat(payload) => {
+                        // Process heartbeat (updates election and peer state)
+                        let mut coord = coordinator.write().await;
+                        coord.process_message(&msg);
+
+                        // Ensure the sender is in our WgTransport peer list for broadcasting
+                        // The sender includes their own info in known_peers
+                        for peer_info in &payload.known_peers {
+                            // Check if this peer is in WgTransport (for broadcast routing)
+                            if !coord.has_wg_peer(&peer_info.node_id) {
+                                info!(
+                                    "Adding peer to WgTransport for broadcasts: {} at {}",
+                                    peer_info.node_id, peer_info.wg_endpoint
+                                );
+                                if let Err(e) = coord.add_runtime_peer(
+                                    &peer_info.node_id,
+                                    &peer_info.wg_pubkey,
+                                    &peer_info.wg_endpoint,
+                                    &peer_info.tunnel_ip,
+                                ) {
+                                    warn!("Failed to add peer {}: {}", peer_info.node_id, e);
+                                }
+                            }
+                        }
+
+                        // Process gossip - discover new peers (for mesh self-healing)
+                        let unknown_peers = coord.peers().find_unknown_peers(&payload.known_peers);
+                        for peer_info in unknown_peers {
+                            // Skip if we already have this peer in WireGuard
+                            if coord.has_wg_peer(&peer_info.node_id) {
+                                continue;
+                            }
+
+                            info!(
+                                "Discovered new peer via gossip: {} at {}",
+                                peer_info.node_id, peer_info.wg_endpoint
+                            );
+
+                            // Add to WireGuard
+                            match coord.add_runtime_peer(
+                                &peer_info.node_id,
+                                &peer_info.wg_pubkey,
+                                &peer_info.wg_endpoint,
+                                &peer_info.tunnel_ip,
+                            ) {
+                                Ok(true) => {
+                                    info!("Added WireGuard peer: {}", peer_info.node_id);
+                                    // Add to peer tracker
+                                    coord.peers_mut().process_gossip(&peer_info);
+
+                                    // Send PeerAnnounce to the new peer so they know about us
+                                    if let Some(wg_config) = &config.wireguard {
+                                        let our_tunnel_ip = wg_config
+                                            .tunnel_ip
+                                            .clone()
+                                            .unwrap_or_else(|| "10.200.200.1".to_string());
+                                        let our_endpoint = format!(
+                                            "{}:{}",
+                                            config.node.id, // This should be our public IP
+                                            wg_config.listen_port
+                                        );
+                                        // Note: We'd need our public key here - for now log the intent
+                                        info!(
+                                            "Would send PeerAnnounce to {} (need our pubkey)",
+                                            peer_info.node_id
+                                        );
+                                        // TODO: Store our WG pubkey in config and send PeerAnnounce
+                                        let _ = our_tunnel_ip;
+                                        let _ = our_endpoint;
+                                    }
+                                },
+                                Ok(false) => {
+                                    debug!("Peer {} already known", peer_info.node_id);
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to add WireGuard peer {}: {}",
+                                        peer_info.node_id, e
+                                    );
+                                },
+                            }
+                        }
+                    },
+                    MessageType::PeerAnnounce(payload) => {
+                        info!(
+                            "Received peer announcement from {} (endpoint: {})",
+                            msg.node_id, payload.wg_endpoint
+                        );
+
+                        // Validate cluster token
+                        let token_valid = config
+                            .coordination
+                            .cluster_token
+                            .as_ref()
+                            .map(|t| t == &payload.cluster_token)
+                            .unwrap_or(true); // If no token configured, accept all
+
+                        if !token_valid {
+                            warn!("Rejected peer {} - invalid cluster token", msg.node_id);
+                            continue;
+                        }
+
+                        let mut coord = coordinator.write().await;
+
+                        // Add to WireGuard if not already known
+                        if !coord.has_wg_peer(&msg.node_id) {
+                            match coord.add_runtime_peer(
+                                &msg.node_id,
+                                &payload.wg_pubkey,
+                                &payload.wg_endpoint,
+                                &payload.tunnel_ip,
+                            ) {
+                                Ok(true) => {
+                                    info!(
+                                        "Added WireGuard peer from announcement: {}",
+                                        msg.node_id
+                                    );
+                                },
+                                Ok(false) => {},
+                                Err(e) => {
+                                    warn!("Failed to add peer {}: {}", msg.node_id, e);
+                                },
+                            }
+                        }
+
+                        // Update peer tracker
+                        if coord.peers_mut().process_peer_announce(&msg) {
+                            info!("Added new peer to tracker: {}", msg.node_id);
+                        }
+                    },
+                    MessageType::IntroPoints(payload) => {
+                        debug!(
+                            "Received {} intro points from {}",
+                            payload.intro_points.len(),
+                            msg.node_id
+                        );
+                        let mut coord = coordinator.write().await;
+                        coord
+                            .peers_mut()
+                            .update_intro_points(&msg.node_id, payload.intro_points.clone());
+                    },
+                    _ => {
+                        // Other message types (LeaseClaim, LeaseRelease, etc.)
+                        let mut coord = coordinator.write().await;
+                        coord.process_message(&msg);
+                    },
+                }
+            },
+            Ok(Err(e)) => {
+                warn!("Error receiving message: {}", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            },
+            Err(_) => {
+                // Timeout - no message received, just loop to try again
+                // This releases the lock periodically
+            },
+        }
+    }
+}
+
+/// Publish loop - manages descriptor publishing with auto-detect mode
+async fn publish_loop(
+    state: Arc<RwLock<RuntimeState>>,
+    coordinator: Arc<RwLock<Coordinator>>,
+    config: Config,
+) -> Result<()> {
+    // Load master key
+    let identity = crate::crypto::load_identity_key(&config.master.identity_key_path)?;
+    let _publisher = Publisher::new(identity);
+
+    // Wait for hidden service to be established before first publish attempt
+    info!("Publish loop waiting 30 seconds for hidden service to establish...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let mut ticker = interval(Duration::from_secs(config.publish.refresh_interval_secs));
+    info!(
+        "Publish loop starting, interval: {} secs",
+        config.publish.refresh_interval_secs
+    );
+
+    loop {
+        ticker.tick().await;
+
+        // Auto-detect mode: check if we have active peers
+        let (has_active_peers, alive_count) = {
+            let coord = coordinator.read().await;
+            let alive = coord.peers().alive_count();
+            (alive > 0, alive)
+        };
+
+        if has_active_peers {
+            info!("Multi-node mode detected: {} active peer(s)", alive_count);
+        } else {
+            debug!("Single-node mode: no active peers");
+        }
+
+        // Check if we should take over publisher role
+        {
+            let mut coord = coordinator.write().await;
+
+            if has_active_peers {
+                // Multi-node mode - use election logic
+                let should_take = coord.election_mut().should_take_over();
+                if should_take {
+                    coord.election_mut().become_publisher();
+                    info!("Became publisher via election");
+
+                    // Announce lease claim
+                    let msg =
+                        CoordMessage::lease_claim(config.node.id.clone(), config.node.priority);
+                    let _ = coord.broadcast(&msg).await;
+                }
+            } else {
+                // In single-node mode (no peers), always be publisher
+                if !coord.election().is_publisher() {
+                    info!("No active peers - auto-becoming publisher");
+                    coord.election_mut().become_publisher();
+                }
+            }
+        }
+
+        // Check if we're publisher
+        let is_publisher = {
+            let coord = coordinator.read().await;
+            coord.election().is_publisher()
+        };
+
+        if !is_publisher {
+            debug!("Not publisher, skipping publish");
+            continue;
+        }
+
+        // Get intro point counts
+        let (own_intro_count, peer_intro_count) = {
+            let state = state.read().await;
+            let coord = coordinator.read().await;
+            (
+                state.own_intro_points.len(),
+                coord.peers().total_peer_intro_points(),
+            )
+        };
+
+        let total_intro_count = own_intro_count + peer_intro_count;
+
+        if !has_active_peers {
+            // Single-node mode: Tor handles publishing automatically
+            info!("Single-node mode: Tor is handling descriptor publishing (we are publisher)");
+        } else if total_intro_count == 0 {
+            // Multi-node but no intro points collected yet
+            warn!(
+                "Multi-node mode but no intro points collected yet - waiting for intro point data"
+            );
+        } else {
+            // Multi-node mode with intro points: merge and publish
+            info!(
+                "Multi-node mode: merging {} own + {} peer intro points",
+                own_intro_count, peer_intro_count
+            );
+            // TODO: Implement merged descriptor publishing via HSPOST
+            // 1. Collect intro points from state.own_intro_points
+            // 2. Collect intro points from coordinator.peers().collect_peer_intro_points()
+            // 3. Build merged descriptor
+            // 4. Publish via HSPOST to HSDirs
+        }
+    }
+}
+
+/// Initial bootstrap - runs BEFORE hidden service is configured on joining nodes
+///
+/// This is a synchronous bootstrap attempt that happens during startup.
+/// By running before HS config, the node won't route .onion requests to itself.
+/// Returns Ok(true) if bootstrap succeeded and peer was added.
+async fn initial_bootstrap(
+    coordinator: &Arc<RwLock<Coordinator>>,
+    config: &Config,
+) -> Result<bool> {
+    let max_attempts = 5;
+    let delay_between_attempts = Duration::from_secs(15);
+
+    // Extract config values
+    let wg_config = config
+        .wireguard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No WireGuard config"))?;
+
+    let (wg_pubkey, wg_endpoint, tunnel_ip) = match (
+        &wg_config.public_key,
+        &wg_config.external_endpoint,
+        &wg_config.tunnel_ip,
+    ) {
+        (Some(p), Some(e), Some(t)) => (p.clone(), e.clone(), t.clone()),
+        _ => return Err(anyhow::anyhow!("Incomplete WireGuard config")),
+    };
+
+    let join_secret = config
+        .coordination
+        .join_secret
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("No join_secret configured"))?;
+
+    let cluster_token = config
+        .coordination
+        .cluster_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("No cluster_token configured"))?;
+
+    for attempt in 1..=max_attempts {
+        info!(
+            "Initial bootstrap attempt {}/{} via Tor to {}",
+            attempt, max_attempts, config.master.onion_address
+        );
+
+        let client = BootstrapClient::new(
+            config.master.onion_address.clone(),
+            80,
+            join_secret.clone(),
+            cluster_token.clone(),
+            config.tor.socks_port,
+            wg_pubkey.clone(),
+            wg_endpoint.clone(),
+            tunnel_ip.clone(),
+        );
+
+        match client.join().await {
+            Ok(response) => {
+                info!(
+                    "Initial bootstrap successful! Node {} responded",
+                    response.responder_node_id
+                );
+
+                // Add the responder as a WireGuard peer
+                let mut coord = coordinator.write().await;
+
+                match coord.add_runtime_peer(
+                    &response.responder_node_id,
+                    &response.responder_wg_pubkey,
+                    &response.responder_wg_endpoint,
+                    &response.responder_tunnel_ip,
+                ) {
+                    Ok(true) => {
+                        info!(
+                            "Added bootstrap peer to WireGuard: {} at {}",
+                            response.responder_node_id, response.responder_wg_endpoint
+                        );
+                    },
+                    Ok(false) => {
+                        debug!("Bootstrap peer already known");
+                    },
+                    Err(e) => {
+                        warn!("Failed to add bootstrap peer to WireGuard: {}", e);
+                    },
+                }
+
+                // Also add any known peers from the response
+                for peer in &response.known_peers {
+                    if peer.node_id == config.node.id {
+                        continue;
+                    }
+                    let _ = coord.add_runtime_peer(
+                        &peer.node_id,
+                        &peer.wg_pubkey,
+                        &peer.wg_endpoint,
+                        &peer.tunnel_ip,
+                    );
+                }
+
+                return Ok(true);
+            },
+            Err(e) => {
+                warn!("Bootstrap attempt {} failed: {}", attempt, e);
+                if attempt < max_attempts {
+                    info!(
+                        "Waiting {} seconds before retry...",
+                        delay_between_attempts.as_secs()
+                    );
+                    tokio::time::sleep(delay_between_attempts).await;
+                }
+            },
+        }
+    }
+
+    Ok(false) // All attempts failed
+}
+
+/// Background bootstrap loop - runs AFTER hidden service is configured
+///
+/// This continues checking for peers in case:
+/// 1. Initial bootstrap failed but WireGuard heartbeats work later
+/// 2. Network conditions change
+///
+/// Since HS is already configured, it won't attempt Tor bootstrap to avoid
+/// self-connection. It just monitors for peer liveness.
+async fn background_bootstrap_loop(
+    coordinator: Arc<RwLock<Coordinator>>,
+    _config: Config,
+) -> Result<()> {
+    let mut ticker = interval(Duration::from_secs(30));
+
+    loop {
+        ticker.tick().await;
+
+        let alive_count = {
+            let coord = coordinator.read().await;
+            coord.peers().alive_count()
+        };
+
+        if alive_count > 0 {
+            debug!("Background check: {} active peer(s)", alive_count);
+        } else {
+            // No active peers, but we can't bootstrap via Tor anymore
+            // (HS is configured, would connect to self)
+            // Just wait for WireGuard heartbeats to potentially work
+            debug!("Background check: No active peers, waiting for WireGuard heartbeats");
+        }
+    }
+}
+
+/// Intro point refresh loop - periodically fetches our own intro points from Tor
+///
+/// This runs on all nodes and updates state.own_intro_points which:
+/// 1. Is reported in heartbeats (intro_point_count)
+/// 2. Is used by publisher to merge into the final descriptor
+async fn intro_point_refresh_loop(state: Arc<RwLock<RuntimeState>>, config: Config) -> Result<()> {
+    // Wait for hidden service to establish first
+    info!("Intro point refresh loop waiting 60 seconds for HS to establish...");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let mut ticker = interval(Duration::from_secs(30)); // Check every 30 seconds
+
+    info!("Intro point refresh loop starting");
+
+    loop {
+        ticker.tick().await;
+
+        // Connect to Tor control port
+        let mut tor = match crate::tor::control::TorController::connect(&config.tor).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to connect to Tor control port: {}", e);
+                continue;
+            },
+        };
+
+        // Get our intro point count from Tor
+        let intro_count = match tor
+            .get_hs_intro_point_count(&config.master.onion_address)
+            .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                debug!("Failed to get intro point count: {}", e);
+                0
+            },
+        };
+
+        // Update state with intro point info
+        // For now, we just track the count - actual intro point data for merging
+        // requires parsing the full descriptor
+        let current_count = {
+            let state = state.read().await;
+            state.own_intro_points.len()
+        };
+
+        if intro_count != current_count {
+            if intro_count > 0 {
+                info!(
+                    "Intro point count changed: {} -> {}",
+                    current_count, intro_count
+                );
+
+                // Update the intro points - for now we create placeholder entries
+                // representing that we have intro points available
+                let mut state = state.write().await;
+                state.own_intro_points.clear();
+                for _ in 0..intro_count {
+                    state.own_intro_points.push(crate::state::OwnIntroPoint {
+                        raw_data: vec![], // Placeholder - actual data from descriptor parsing
+                    });
+                }
+            } else if current_count > 0 {
+                warn!("Intro points dropped to 0 (was {})", current_count);
+                let mut state = state.write().await;
+                state.own_intro_points.clear();
+            }
+        } else if intro_count > 0 {
+            debug!("Intro points stable at {}", intro_count);
+        }
+    }
+}

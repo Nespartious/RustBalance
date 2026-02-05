@@ -1,0 +1,92 @@
+[package]
+name = "rustbalance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"  # MSRV - updated due to transitive deps requiring edition2024
+authors = ["nespartious"]
+description = "Onionbalance reimplementation in Rust with self-healing capabilities via lease-based publisher election"
+license = "MIT"
+repository = "https://github.com/nespartious/RustBalance"
+keywords = ["tor", "onion", "load-balancer", "hidden-services", "anonymity"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+# Async runtime (verified: crates.io/crates/tokio)
+tokio = { version = "1.35", features = ["full", "process"] }
+
+# Serialization (verified: crates.io)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"  # For coordination messages
+toml = "0.8"
+
+# Cryptography - all verified on crates.io
+ed25519-dalek = { version = "2.1", features = ["hazmat"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }  # X25519 ECDH for key exchange
+curve25519-dalek = "4.1"      # Low-level curve ops for blinding
+sha2 = "0.10"
+sha3 = "0.10"                 # Tor uses SHA3-256 for some operations
+rand = "0.8"
+aes = "0.8"                   # AES block cipher for CTR mode
+aes-gcm = "0.10"              # Encrypting master key in join tokens
+ctr = "0.9"                   # CTR mode for descriptor decryption (Tor spec)
+subtle = "2.5"                # Constant-time comparison for security-sensitive ops
+
+# Base encoding (verified: crates.io)
+base64 = "0.22"
+data-encoding = "2.5"         # For base32 (onion addresses)
+
+# Networking
+socket2 = "0.5"
+
+# Time handling
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Logging (verified: crates.io)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling (verified: crates.io)
+thiserror = "1.0"
+anyhow = "1.0"
+
+# CLI (verified: crates.io)
+clap = { version = "4.4", features = ["derive"] }
+
+# Password input (verified: crates.io)
+rpassword = "7.3"
+hex = "0.4.3"
+
+# NOTE: torut is unmaintained (last update 2021). We implement Tor control
+# protocol directly instead. See src/tor/control.rs
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Security-focused lints
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Code quality
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Allow these in pedantic
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

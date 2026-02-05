@@ -1,0 +1,29 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets - NEVER commit these
+*.key
+*.pem
+master_ed25519*
+*.secret
+
+# Runtime
+*.log
+*.pid
+
+# Testing session files (contain SSH credentials)
+testing/session.env
+testing/*.log

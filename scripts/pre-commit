@@ -1,0 +1,40 @@
+#!/bin/bash
+# Pre-commit hook for RustBalance
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# Format check
+echo "  📝 Checking formatting..."
+cargo fmt --all -- --check
+
+# Clippy
+echo "  📎 Running clippy..."
+cargo clippy --all-features -- -D warnings
+
+# Tests
+echo "  🧪 Running tests..."
+cargo test --quiet
+
+# Check for common issues
+echo "  🔒 Security checks..."
+
+# Check for unwrap() in src/ (should use expect or ? instead)
+if grep -r "\.unwrap()" src/ --include="*.rs" | grep -v "// SAFETY:" | grep -v "#\[cfg(test)\]" | head -5; then
+    echo "⚠️  Warning: Found .unwrap() calls without safety comments"
+fi
+
+# Check for panic!() outside tests
+if grep -r "panic!" src/ --include="*.rs" | grep -v "#\[cfg(test)\]" | grep -v "// PANIC:" | head -5; then
+    echo "⚠️  Warning: Found panic!() calls - consider returning Result instead"
+fi
+
+# Check for TODO/FIXME (just warn, don't block)
+TODO_COUNT=$(grep -r "TODO\|FIXME" src/ --include="*.rs" | wc -l)
+if [ "$TODO_COUNT" -gt 0 ]; then
+    echo "  📌 Note: $TODO_COUNT TODO/FIXME comments found"
+fi
+
+echo "✅ Pre-commit checks passed!"

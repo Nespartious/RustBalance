@@ -1,0 +1,17 @@
+# Clippy configuration for RustBalance
+# Security-focused linting for Tor/anonymity infrastructure
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 25
+
+# Limit type complexity
+type-complexity-threshold = 250
+
+# Disallow large enum variants (memory layout matters for crypto)
+enum-variant-size-threshold = 200
+
+# Function parameter limit
+too-many-arguments-threshold = 7
+
+# Maximum lines in a function
+too-many-lines-threshold = 100

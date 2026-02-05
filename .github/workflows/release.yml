@@ -1,0 +1,59 @@
+name: Release
+
+# Manual trigger for release builds
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+        type: string
+      create_release:
+        description: 'Create GitHub release'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build release binary
+        run: cargo build --release
+        
+      - name: Run tests
+        run: cargo test --release
+        
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustbalance-linux-x64
+          path: target/release/rustbalance
+          
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ inputs.create_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustbalance-linux-x64
+          path: artifacts/
+          
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.version }}
+          name: RustBalance ${{ inputs.version }}
+          files: artifacts/rustbalance
+          draft: true
