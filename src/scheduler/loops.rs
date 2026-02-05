@@ -563,6 +563,9 @@ async fn publish_loop(
     tokio::time::sleep(Duration::from_secs(90)).await;
 
     let mut ticker = interval(Duration::from_secs(config.publish.refresh_interval_secs));
+    // Tick immediately on first iteration (don't wait for full interval)
+    ticker.tick().await;
+    
     info!(
         "Publish loop starting, interval: {} secs",
         config.publish.refresh_interval_secs
@@ -572,7 +575,6 @@ async fn publish_loop(
     let max_intro_points = 20;
 
     loop {
-        ticker.tick().await;
 
         // Auto-detect mode: check if we have active peers
         let (has_active_peers, alive_count) = {
@@ -761,6 +763,9 @@ async fn publish_loop(
                 },
             }
         }
+        
+        // Wait for next publish interval
+        ticker.tick().await;
     }
 }
 
