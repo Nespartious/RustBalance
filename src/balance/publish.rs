@@ -20,13 +20,14 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn new(identity: MasterIdentity) -> Self {
-        // Initialize revision counter based on current time to ensure it's
-        // higher than any existing descriptors (which use timestamp-based revisions)
-        // Note: Using (time + large offset) to overcome any stale high-revision descriptors
+        // Initialize revision counter to be HIGHER than Tor's automatic revision counter.
+        // Tor appears to use approximately (timestamp * 2.7) for revisions.
+        // We use (timestamp * 3) to ensure we always override Tor's descriptors.
+        // This is critical for multi-node mode where we HSPOST our own merged descriptor.
         let initial_revision = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() + 1_000_000_000) // Add 1 billion to ensure higher than stale descriptors
-            .unwrap_or(3_000_000_000);
+            .map(|d| d.as_secs() * 3) // Multiply by 3 to always be higher than Tor's ~2.7x formula
+            .unwrap_or(6_000_000_000);
 
         Self {
             identity,
