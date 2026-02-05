@@ -249,7 +249,7 @@ impl OnionService {
 
     /// Handle a single proxied connection
     async fn handle_connection(
-        mut client: TcpStream,
+        client: TcpStream,
         target: &str,
         target_port: u16,
         socks_port: u16,
@@ -306,7 +306,60 @@ impl OnionService {
 
         debug!("SOCKS5 connection established to {}", domain);
 
-        // Now bidirectionally proxy data
+        // Now proxy with Host header rewriting
+        Self::proxy_with_host_rewrite(client, socks, &domain, target_port).await
+    }
+
+    /// Proxy connection with HTTP Host header rewriting
+    ///
+    /// Many sites (like Dread) require the correct Host header.
+    /// We rewrite it from the master onion to the target onion.
+    async fn proxy_with_host_rewrite(
+        mut client: TcpStream,
+        mut socks: TcpStream,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<()> {
+        // Read the initial request to check if it's HTTP and needs Host rewriting
+        let mut buf = vec![0u8; 8192];
+        let n = client.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(()); // Client disconnected
+        }
+
+        let request_data = &buf[..n];
+
+        // Check if this looks like an HTTP request
+        let is_http = request_data.starts_with(b"GET ")
+            || request_data.starts_with(b"POST ")
+            || request_data.starts_with(b"HEAD ")
+            || request_data.starts_with(b"PUT ")
+            || request_data.starts_with(b"DELETE ")
+            || request_data.starts_with(b"PATCH ")
+            || request_data.starts_with(b"OPTIONS ")
+            || request_data.starts_with(b"CONNECT ");
+
+        if is_http {
+            // Rewrite Host header to target
+            let request_str = String::from_utf8_lossy(request_data);
+            let target_with_port = if target_port == 80 {
+                target_host.to_string()
+            } else {
+                format!("{}:{}", target_host, target_port)
+            };
+
+            // Replace Host header (case-insensitive)
+            let modified = Self::rewrite_host_header(&request_str, &target_with_port);
+            debug!("Rewriting Host header to {}", target_with_port);
+
+            // Send modified request to target
+            socks.write_all(modified.as_bytes()).await?;
+        } else {
+            // Not HTTP, just forward raw
+            socks.write_all(request_data).await?;
+        }
+
+        // Now bidirectionally proxy the rest
         let (mut client_read, mut client_write) = client.split();
         let (mut socks_read, mut socks_write) = socks.split();
 
@@ -327,6 +380,32 @@ impl OnionService {
         }
 
         Ok(())
+    }
+
+    /// Rewrite the Host header in an HTTP request
+    fn rewrite_host_header(request: &str, new_host: &str) -> String {
+        let mut result = String::with_capacity(request.len() + new_host.len());
+        let mut host_replaced = false;
+
+        for line in request.split("\r\n") {
+            if !result.is_empty() {
+                result.push_str("\r\n");
+            }
+
+            // Check for Host header (case-insensitive)
+            if !host_replaced && line.len() > 5 {
+                let lower = line.to_lowercase();
+                if lower.starts_with("host:") {
+                    result.push_str(&format!("Host: {}", new_host));
+                    host_replaced = true;
+                    continue;
+                }
+            }
+
+            result.push_str(line);
+        }
+
+        result
     }
 }
 
