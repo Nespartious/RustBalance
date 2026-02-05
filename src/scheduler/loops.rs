@@ -534,9 +534,11 @@ async fn publish_loop(
     let identity = crate::crypto::load_identity_key(&config.master.identity_key_path)?;
     let mut publisher = Publisher::new(identity);
 
-    // Wait for hidden service to be established before first publish attempt
-    info!("Publish loop waiting 30 seconds for hidden service to establish...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    // Wait for hidden service to be established AND intro points to be collected
+    // The intro_check loop waits 60 seconds then checks every 30 seconds,
+    // so we wait 90 seconds to ensure at least one intro point check has completed.
+    info!("Publish loop waiting 90 seconds for hidden service and intro points...");
+    tokio::time::sleep(Duration::from_secs(90)).await;
 
     let mut ticker = interval(Duration::from_secs(config.publish.refresh_interval_secs));
     info!(
