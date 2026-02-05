@@ -343,6 +343,32 @@ async fn heartbeat_loop(
         if let Err(e) = coord.broadcast(&msg).await {
             warn!("Failed to send heartbeat: {}", e);
         }
+
+        // Also broadcast our intro points with every heartbeat
+        // This ensures peers receive them even if initial messages were rejected
+        if intro_point_count > 0 {
+            let intro_points = {
+                let state = state.read().await;
+                state.own_intro_points.clone()
+            };
+
+            if !intro_points.is_empty() {
+                let intro_data: Vec<crate::coord::IntroPointData> = intro_points
+                    .iter()
+                    .map(|ip| crate::coord::IntroPointData {
+                        data: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            ip.to_bytes(),
+                        ),
+                    })
+                    .collect();
+
+                let intro_msg = CoordMessage::intro_points(config.node.id.clone(), intro_data);
+                if let Err(e) = coord.broadcast(&intro_msg).await {
+                    debug!("Failed to broadcast intro points with heartbeat: {}", e);
+                }
+            }
+        }
     }
 }
 
