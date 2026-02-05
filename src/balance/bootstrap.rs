@@ -220,7 +220,7 @@ mod tests {
             wg_pubkey: "pubkey123".to_string(),
             wg_endpoint: "192.168.1.1:51820".to_string(),
             tunnel_ip: "10.0.0.1".to_string(),
-            request_time: 1234567890,
+            request_time: 1_234_567_890,
         };
 
         let json = serde_json::to_string(&request).unwrap();

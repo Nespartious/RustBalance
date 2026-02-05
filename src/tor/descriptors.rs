@@ -44,6 +44,164 @@ pub struct IntroductionPoint {
 }
 
 impl IntroductionPoint {
+    /// Serialize intro point to bytes for network transmission
+    /// Format: link_spec_count(1) + link_specs + onion_key(32) + auth_key_cert_len(2) + auth_key_cert
+    ///         + enc_key(32) + enc_key_cert_len(2) + enc_key_cert
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Link specifiers
+        #[allow(clippy::cast_possible_truncation)]
+        buf.push(self.link_specifiers.len() as u8);
+        for spec in &self.link_specifiers {
+            match spec {
+                LinkSpecifier::IPv4 { addr, port } => {
+                    buf.push(0); // Type
+                    buf.push(6); // Length
+                    buf.extend_from_slice(addr);
+                    buf.extend_from_slice(&port.to_be_bytes());
+                },
+                LinkSpecifier::IPv6 { addr, port } => {
+                    buf.push(1);
+                    buf.push(18);
+                    buf.extend_from_slice(addr);
+                    buf.extend_from_slice(&port.to_be_bytes());
+                },
+                LinkSpecifier::LegacyId(id) => {
+                    buf.push(2);
+                    buf.push(20);
+                    buf.extend_from_slice(id);
+                },
+                LinkSpecifier::Ed25519Id(id) => {
+                    buf.push(3);
+                    buf.push(32);
+                    buf.extend_from_slice(id);
+                },
+            }
+        }
+
+        // Onion key
+        buf.extend_from_slice(&self.onion_key);
+
+        // Auth key cert (length-prefixed)
+        #[allow(clippy::cast_possible_truncation)]
+        let auth_len = self.auth_key_cert.len() as u16;
+        buf.extend_from_slice(&auth_len.to_be_bytes());
+        buf.extend_from_slice(&self.auth_key_cert);
+
+        // Enc key
+        buf.extend_from_slice(&self.enc_key);
+
+        // Enc key cert (length-prefixed)
+        #[allow(clippy::cast_possible_truncation)]
+        let enc_len = self.enc_key_cert.len() as u16;
+        buf.extend_from_slice(&enc_len.to_be_bytes());
+        buf.extend_from_slice(&self.enc_key_cert);
+
+        buf
+    }
+
+    /// Deserialize intro point from bytes
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+
+        let mut offset = 0;
+
+        // Parse link specifiers
+        let nspec = data[offset] as usize;
+        offset += 1;
+
+        let mut link_specifiers = Vec::new();
+        for _ in 0..nspec {
+            if offset + 2 > data.len() {
+                return None;
+            }
+            let lstype = data[offset];
+            let lslen = data[offset + 1] as usize;
+            offset += 2;
+
+            if offset + lslen > data.len() {
+                return None;
+            }
+            let lsdata = &data[offset..offset + lslen];
+            offset += lslen;
+
+            match lstype {
+                0 if lslen >= 6 => {
+                    let addr = [lsdata[0], lsdata[1], lsdata[2], lsdata[3]];
+                    let port = u16::from_be_bytes([lsdata[4], lsdata[5]]);
+                    link_specifiers.push(LinkSpecifier::IPv4 { addr, port });
+                },
+                1 if lslen >= 18 => {
+                    let mut addr = [0u8; 16];
+                    addr.copy_from_slice(&lsdata[0..16]);
+                    let port = u16::from_be_bytes([lsdata[16], lsdata[17]]);
+                    link_specifiers.push(LinkSpecifier::IPv6 { addr, port });
+                },
+                2 if lslen >= 20 => {
+                    let mut id = [0u8; 20];
+                    id.copy_from_slice(&lsdata[..20]);
+                    link_specifiers.push(LinkSpecifier::LegacyId(id));
+                },
+                3 if lslen >= 32 => {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&lsdata[..32]);
+                    link_specifiers.push(LinkSpecifier::Ed25519Id(id));
+                },
+                _ => {}, // Skip unknown
+            }
+        }
+
+        // Onion key
+        if offset + 32 > data.len() {
+            return None;
+        }
+        let mut onion_key = [0u8; 32];
+        onion_key.copy_from_slice(&data[offset..offset + 32]);
+        offset += 32;
+
+        // Auth key cert
+        if offset + 2 > data.len() {
+            return None;
+        }
+        let auth_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if offset + auth_len > data.len() {
+            return None;
+        }
+        let auth_key_cert = data[offset..offset + auth_len].to_vec();
+        offset += auth_len;
+
+        // Enc key
+        if offset + 32 > data.len() {
+            return None;
+        }
+        let mut enc_key = [0u8; 32];
+        enc_key.copy_from_slice(&data[offset..offset + 32]);
+        offset += 32;
+
+        // Enc key cert
+        if offset + 2 > data.len() {
+            return None;
+        }
+        let enc_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if offset + enc_len > data.len() {
+            return None;
+        }
+        let enc_key_cert = data[offset..offset + enc_len].to_vec();
+
+        Some(Self {
+            link_specifiers,
+            onion_key,
+            auth_key_cert,
+            enc_key,
+            enc_key_cert,
+        })
+    }
+
     /// Extract the auth key from the auth key certificate
     /// Certificate format: version(1) + type(1) + expiry(4) + key_type(1) + key(32) + ...
     pub fn auth_key(&self) -> Option<[u8; 32]> {

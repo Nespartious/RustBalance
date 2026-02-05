@@ -3,15 +3,9 @@
 use crate::config::Config;
 use crate::coord::lease::Lease;
 use crate::coord::messages::NodeRole;
+use crate::tor::IntroductionPoint;
 use std::collections::HashMap;
 use std::time::SystemTime;
-
-/// Our node's introduction points (raw data for merging)
-#[derive(Debug, Clone)]
-pub struct OwnIntroPoint {
-    /// Raw introduction point data from descriptor
-    pub raw_data: Vec<u8>,
-}
 
 /// Shared runtime state
 #[derive(Debug)]
@@ -20,10 +14,10 @@ pub struct RuntimeState {
     pub role: NodeRole,
     /// Last successful publish time
     pub last_publish: Option<SystemTime>,
-    /// Our own introduction points (from our hidden service)
-    pub own_intro_points: Vec<OwnIntroPoint>,
+    /// Our own introduction points (parsed from our hidden service descriptor)
+    pub own_intro_points: Vec<IntroductionPoint>,
     /// Introduction points from peer nodes (for merging when we're publisher)
-    pub peer_intro_points: HashMap<String, Vec<OwnIntroPoint>>,
+    pub peer_intro_points: HashMap<String, Vec<IntroductionPoint>>,
     /// Current lease (if held)
     pub lease: Option<Lease>,
     /// Is our hidden service running?

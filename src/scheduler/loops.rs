@@ -222,9 +222,11 @@ pub async fn run(
 
     // Intro point refresh loop - periodically fetches our intro points from Tor
     let state_clone = Arc::clone(&state);
+    let coord_clone = Arc::clone(&coordinator);
     let config_clone = config.clone();
-    let intro_point_handle =
-        tokio::spawn(async move { intro_point_refresh_loop(state_clone, config_clone).await });
+    let intro_point_handle = tokio::spawn(async move {
+        intro_point_refresh_loop(state_clone, coord_clone, config_clone).await
+    });
 
     // Run the reverse proxy (blocking)
     let proxy_handle = tokio::spawn(async move { onion_service.run_proxy().await });
@@ -526,9 +528,11 @@ async fn publish_loop(
     coordinator: Arc<RwLock<Coordinator>>,
     config: Config,
 ) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
     // Load master key
     let identity = crate::crypto::load_identity_key(&config.master.identity_key_path)?;
-    let _publisher = Publisher::new(identity);
+    let mut publisher = Publisher::new(identity);
 
     // Wait for hidden service to be established before first publish attempt
     info!("Publish loop waiting 30 seconds for hidden service to establish...");
@@ -539,6 +543,9 @@ async fn publish_loop(
         "Publish loop starting, interval: {} secs",
         config.publish.refresh_interval_secs
     );
+
+    // Max intro points per descriptor (Tor spec limit)
+    let max_intro_points = 20;
 
     loop {
         ticker.tick().await;
@@ -618,11 +625,74 @@ async fn publish_loop(
                 "Multi-node mode: merging {} own + {} peer intro points",
                 own_intro_count, peer_intro_count
             );
-            // TODO: Implement merged descriptor publishing via HSPOST
-            // 1. Collect intro points from state.own_intro_points
-            // 2. Collect intro points from coordinator.peers().collect_peer_intro_points()
-            // 3. Build merged descriptor
-            // 4. Publish via HSPOST to HSDirs
+
+            // 1. Collect own intro points
+            let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
+                let state = state.read().await;
+                state.own_intro_points.clone()
+            };
+
+            // 2. Collect and deserialize peer intro points
+            let peer_intro_data = {
+                let coord = coordinator.read().await;
+                coord
+                    .peers()
+                    .collect_peer_intro_points()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
+            let mut peer_intro_points: Vec<crate::tor::IntroductionPoint> = Vec::new();
+            for data in &peer_intro_data {
+                match STANDARD.decode(&data.data) {
+                    Ok(bytes) => {
+                        if let Some(ip) = crate::tor::IntroductionPoint::from_bytes(&bytes) {
+                            peer_intro_points.push(ip);
+                        } else {
+                            warn!("Failed to deserialize intro point from peer data");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to decode base64 intro point data: {}", e);
+                    },
+                }
+            }
+
+            // 3. Merge intro points, capping at max
+            let mut merged: Vec<crate::tor::IntroductionPoint> = own_intro_points;
+            merged.extend(peer_intro_points);
+
+            if merged.len() > max_intro_points {
+                info!(
+                    "Capping {} intro points to max {}",
+                    merged.len(),
+                    max_intro_points
+                );
+                merged.truncate(max_intro_points);
+            }
+
+            info!(
+                "Publishing merged descriptor with {} intro points",
+                merged.len()
+            );
+
+            // 4. Connect to Tor and publish via HSPOST
+            match crate::tor::control::TorController::connect(&config.tor).await {
+                Ok(mut tor) => {
+                    if let Err(e) = publisher.publish(&mut tor, merged).await {
+                        warn!("Failed to publish merged descriptor: {}", e);
+                    } else {
+                        info!("Successfully published merged descriptor via HSPOST");
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to Tor control port for publishing: {}",
+                        e
+                    );
+                },
+            }
         }
     }
 }
@@ -777,15 +847,32 @@ async fn background_bootstrap_loop(
     }
 }
 
-/// Intro point refresh loop - periodically fetches our own intro points from Tor
+/// Intro point refresh loop - periodically fetches and parses our own descriptor
 ///
 /// This runs on all nodes and updates state.own_intro_points which:
 /// 1. Is reported in heartbeats (intro_point_count)
-/// 2. Is used by publisher to merge into the final descriptor
-async fn intro_point_refresh_loop(state: Arc<RwLock<RuntimeState>>, config: Config) -> Result<()> {
+/// 2. Is broadcast to peers via IntroPoints messages
+/// 3. Is used by publisher to merge into the final descriptor
+async fn intro_point_refresh_loop(
+    state: Arc<RwLock<RuntimeState>>,
+    coordinator: Arc<RwLock<Coordinator>>,
+    config: Config,
+) -> Result<()> {
     // Wait for hidden service to establish first
     info!("Intro point refresh loop waiting 60 seconds for HS to establish...");
     tokio::time::sleep(Duration::from_secs(60)).await;
+
+    // Load master identity key for descriptor decryption
+    let identity = match crate::crypto::load_identity_key(&config.master.identity_key_path) {
+        Ok(id) => id,
+        Err(e) => {
+            error!(
+                "Failed to load master identity key for intro point parsing: {}",
+                e
+            );
+            return Err(e);
+        },
+    };
 
     let mut ticker = interval(Duration::from_secs(30)); // Check every 30 seconds
 
@@ -803,49 +890,84 @@ async fn intro_point_refresh_loop(state: Arc<RwLock<RuntimeState>>, config: Conf
             },
         };
 
-        // Get our intro point count from Tor
-        let intro_count = match tor
-            .get_hs_intro_point_count(&config.master.onion_address)
+        // Fetch our descriptor from Tor
+        let descriptor_raw = match tor
+            .get_own_hs_descriptor(&config.master.onion_address)
             .await
         {
-            Ok(count) => count,
+            Ok(Some(desc)) => desc,
+            Ok(None) => {
+                debug!("No descriptor available yet for our service");
+                continue;
+            },
             Err(e) => {
-                debug!("Failed to get intro point count: {}", e);
-                0
+                debug!("Failed to get our descriptor: {}", e);
+                continue;
             },
         };
 
-        // Update state with intro point info
-        // For now, we just track the count - actual intro point data for merging
-        // requires parsing the full descriptor
-        let current_count = {
-            let state = state.read().await;
-            state.own_intro_points.len()
+        // Parse and decrypt the descriptor to extract intro points
+        let intro_points = match crate::tor::HsDescriptor::parse_and_decrypt_with_pubkey(
+            &descriptor_raw,
+            identity.public_key(),
+        ) {
+            Ok(desc) => desc.introduction_points,
+            Err(e) => {
+                warn!("Failed to parse/decrypt our descriptor: {}", e);
+                if descriptor_raw.len() > 5000 {
+                    debug!("Descriptor exists but decryption failed");
+                }
+                continue;
+            },
         };
 
-        if intro_count != current_count {
-            if intro_count > 0 {
-                info!(
-                    "Intro point count changed: {} -> {}",
-                    current_count, intro_count
-                );
+        let new_count = intro_points.len();
 
-                // Update the intro points - for now we create placeholder entries
-                // representing that we have intro points available
-                let mut state = state.write().await;
-                state.own_intro_points.clear();
-                for _ in 0..intro_count {
-                    state.own_intro_points.push(crate::state::OwnIntroPoint {
-                        raw_data: vec![], // Placeholder - actual data from descriptor parsing
-                    });
+        // Check if intro points changed
+        let (current_count, changed) = {
+            let state = state.read().await;
+            let current = state.own_intro_points.len();
+            // Simple change detection: count changed
+            (current, current != new_count)
+        };
+
+        if changed && new_count > 0 {
+            info!(
+                "Intro points updated: {} -> {} (parsed from descriptor)",
+                current_count, new_count
+            );
+
+            // Serialize intro points for broadcast
+            let intro_data: Vec<crate::coord::IntroPointData> = intro_points
+                .iter()
+                .map(|ip| crate::coord::IntroPointData {
+                    data: base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        ip.to_bytes(),
+                    ),
+                })
+                .collect();
+
+            // Broadcast to peers
+            let msg = CoordMessage::intro_points(config.node.id.clone(), intro_data);
+            {
+                let coord = coordinator.write().await;
+                if let Err(e) = coord.broadcast(&msg).await {
+                    warn!("Failed to broadcast intro points: {}", e);
+                } else {
+                    debug!("Broadcast {} intro points to peers", new_count);
                 }
-            } else if current_count > 0 {
-                warn!("Intro points dropped to 0 (was {})", current_count);
-                let mut state = state.write().await;
-                state.own_intro_points.clear();
             }
-        } else if intro_count > 0 {
-            debug!("Intro points stable at {}", intro_count);
+
+            // Update local state
+            let mut state = state.write().await;
+            state.own_intro_points = intro_points;
+        } else if new_count > 0 && !changed {
+            debug!("Intro points stable at {}", new_count);
+        } else if current_count > 0 && new_count == 0 {
+            warn!("Intro points dropped to 0 (was {})", current_count);
+            let mut state = state.write().await;
+            state.own_intro_points.clear();
         }
     }
 }

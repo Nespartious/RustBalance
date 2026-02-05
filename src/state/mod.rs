@@ -4,4 +4,4 @@
 
 mod model;
 
-pub use model::{OwnIntroPoint, RuntimeState};
+pub use model::RuntimeState;
