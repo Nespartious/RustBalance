@@ -921,16 +921,33 @@ wait_for_hidden_service() {
             continue
         fi
         
-        # Try to connect via curl with SOCKS5 proxy (more reliable than torsocks)
+        # Try multiple methods to check connectivity (some sites have different defenses)
+        echo -e "  [${ELAPSED}s] Testing connection to $ONION_ADDRESS..."
+        REACHABLE=false
+        
+        # Method 1: curl with native SOCKS5 support (most reliable)
         if command -v curl &>/dev/null; then
-            echo -e "  [${ELAPSED}s] Testing connection to $ONION_ADDRESS..."
             if timeout 30 curl -s --socks5-hostname 127.0.0.1:9050 --max-time 25 "http://$ONION_ADDRESS/" > /dev/null 2>&1; then
-                echo ""
-                echo -e "${GREEN}✓ HIDDEN SERVICE IS LIVE AND REACHABLE!${NC}"
-                echo ""
-                return 0
+                REACHABLE=true
             fi
-        else
+        fi
+        
+        # Method 2: torsocks wrapper (fallback)
+        if [ "$REACHABLE" = false ] && command -v torsocks &>/dev/null && command -v curl &>/dev/null; then
+            if timeout 30 torsocks curl -s --max-time 25 "http://$ONION_ADDRESS/" > /dev/null 2>&1; then
+                REACHABLE=true
+            fi
+        fi
+        
+        if [ "$REACHABLE" = true ]; then
+            echo ""
+            echo -e "${GREEN}✓ HIDDEN SERVICE IS LIVE AND REACHABLE!${NC}"
+            echo ""
+            return 0
+        fi
+        
+        # Fallback: check logs if no curl available
+        if ! command -v curl &>/dev/null; then
             # Without curl, just check if Tor reports the HS as published
             # by checking the logs for "Uploaded rendezvous descriptor"
             if sudo journalctl -u tor@default --since "5 minutes ago" 2>/dev/null | grep -q "Uploaded rendezvous descriptor"; then
