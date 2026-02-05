@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Run the main scheduler
 pub async fn run(
@@ -360,6 +360,12 @@ async fn receive_loop(coordinator: Arc<RwLock<Coordinator>>, config: Config) -> 
                     continue;
                 }
 
+                // Skip our own messages (shouldn't happen but prevents self-as-peer bug)
+                if msg.node_id == config.node.id {
+                    trace!("Ignoring our own message");
+                    continue;
+                }
+
                 // Handle different message types
                 match &msg.message {
                     MessageType::Heartbeat(payload) => {
@@ -370,6 +376,11 @@ async fn receive_loop(coordinator: Arc<RwLock<Coordinator>>, config: Config) -> 
                         // Ensure the sender is in our WgTransport peer list for broadcasting
                         // The sender includes their own info in known_peers
                         for peer_info in &payload.known_peers {
+                            // Skip ourselves
+                            if peer_info.node_id == config.node.id {
+                                continue;
+                            }
+
                             // Check if this peer is in WgTransport (for broadcast routing)
                             if !coord.has_wg_peer(&peer_info.node_id) {
                                 info!(
@@ -390,6 +401,11 @@ async fn receive_loop(coordinator: Arc<RwLock<Coordinator>>, config: Config) -> 
                         // Process gossip - discover new peers (for mesh self-healing)
                         let unknown_peers = coord.peers().find_unknown_peers(&payload.known_peers);
                         for peer_info in unknown_peers {
+                            // Skip ourselves (we might be in someone else's known_peers)
+                            if peer_info.node_id == config.node.id {
+                                continue;
+                            }
+
                             // Skip if we already have this peer in WireGuard
                             if coord.has_wg_peer(&peer_info.node_id) {
                                 continue;
