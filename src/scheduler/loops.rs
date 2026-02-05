@@ -636,8 +636,44 @@ async fn publish_loop(
         let total_intro_count = own_intro_count + peer_intro_count;
 
         if !has_active_peers {
-            // Single-node mode: Tor handles publishing automatically
-            info!("Single-node mode: Tor is handling descriptor publishing (we are publisher)");
+            // Single-node mode: We STILL need to HSPOST for the master address
+            // because Tor only auto-publishes for the node's own address, not master.
+            // In the new architecture, each node has a unique address, so we must
+            // explicitly publish for the master address.
+            info!("Single-node mode: publishing descriptor for master address via HSPOST");
+
+            // Get our own intro points
+            let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
+                let state = state.read().await;
+                state.own_intro_points.clone()
+            };
+
+            if own_intro_points.is_empty() {
+                debug!("No intro points yet, waiting...");
+                continue;
+            }
+
+            info!(
+                "Publishing descriptor with {} intro points for master address",
+                own_intro_points.len()
+            );
+
+            // Connect to Tor and publish via HSPOST
+            match crate::tor::control::TorController::connect(&config.tor).await {
+                Ok(mut tor) => {
+                    if let Err(e) = publisher.publish(&mut tor, own_intro_points).await {
+                        warn!("Failed to publish descriptor: {}", e);
+                    } else {
+                        info!("Successfully published descriptor for master address via HSPOST");
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to Tor control port for publishing: {}",
+                        e
+                    );
+                },
+            }
         } else if total_intro_count == 0 {
             // Multi-node but no intro points collected yet
             warn!(
