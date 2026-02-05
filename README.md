@@ -312,8 +312,10 @@ src/
 - [Configuration Reference](docs/CONFIG.md) - All config options explained
 - [Protocol Specification](docs/PROTOCOL.md) - Message types and state machine
 - [Security Guidelines](docs/SECURITY.md) - Deployment security best practices
-- [Architecture Deep Dive](ARCHITECTURE.md) - Detailed design decisions
+- [Architecture Deep Dive](docs/ARCHITECTURE.md) - Detailed design decisions
 - [Challenges & Solutions](docs/CHALLENGES.md) - Technical challenges addressed
+- [Development Guide](docs/DEVELOPMENT.md) - Building and contributing
+- [Roadmap](docs/ROADMAP.md) - Project phases and progress
 
 ---
 
