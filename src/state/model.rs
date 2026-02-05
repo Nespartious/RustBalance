@@ -24,6 +24,10 @@ pub struct RuntimeState {
     pub hs_running: bool,
     /// Target service health status
     pub target_healthy: bool,
+    /// Has Tor's automatic descriptor publishing been disabled?
+    /// This is set to true when we enter multi-node mode to prevent
+    /// Tor from overwriting our HSPOST descriptors.
+    pub tor_publish_disabled: bool,
 }
 
 impl RuntimeState {
@@ -37,6 +41,7 @@ impl RuntimeState {
             lease: None,
             hs_running: false,
             target_healthy: false,
+            tor_publish_disabled: false,
         }
     }
 

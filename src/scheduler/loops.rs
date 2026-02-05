@@ -626,6 +626,13 @@ async fn publish_loop(
                 own_intro_count, peer_intro_count
             );
 
+            // Check if we need to disable Tor's auto-publishing
+            // This prevents Tor from overwriting our HSPOST with its own descriptor
+            let need_disable_tor_publish = {
+                let state = state.read().await;
+                !state.tor_publish_disabled
+            };
+
             // 1. Collect own intro points
             let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
                 let state = state.read().await;
@@ -680,6 +687,23 @@ async fn publish_loop(
             // 4. Connect to Tor and publish via HSPOST
             match crate::tor::control::TorController::connect(&config.tor).await {
                 Ok(mut tor) => {
+                    // If this is our first multi-node publish, disable Tor's auto-publishing
+                    // to prevent it from overwriting our merged descriptor with its own
+                    if need_disable_tor_publish {
+                        info!("Disabling Tor's automatic descriptor publishing for multi-node mode");
+                        match tor.set_publish_descriptors(false).await {
+                            Ok(_) => {
+                                let mut state = state.write().await;
+                                state.tor_publish_disabled = true;
+                                info!("Tor auto-publishing disabled successfully");
+                            },
+                            Err(e) => {
+                                warn!("Failed to disable Tor auto-publishing: {}", e);
+                                // Continue anyway - our HSPOST might still work if we get lucky
+                            },
+                        }
+                    }
+
                     if let Err(e) = publisher.publish(&mut tor, merged).await {
                         warn!("Failed to publish merged descriptor: {}", e);
                     } else {

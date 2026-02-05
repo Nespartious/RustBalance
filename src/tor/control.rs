@@ -411,6 +411,26 @@ impl TorController {
         }
     }
 
+    /// Enable or disable Tor's automatic hidden service descriptor publishing
+    ///
+    /// When disabled (enabled=false), Tor will still create and manage intro points,
+    /// but will NOT publish descriptors to HSDirs. This allows RustBalance to publish
+    /// merged descriptors via HSPOST without Tor overwriting them.
+    ///
+    /// Use this in multi-node mode where we handle descriptor publishing ourselves.
+    pub async fn set_publish_descriptors(&mut self, enabled: bool) -> Result<()> {
+        let value = if enabled { "1" } else { "0" };
+        let cmd = format!("SETCONF PublishHidServDescriptors={}\r\n", value);
+        info!(
+            "Setting PublishHidServDescriptors={} (Tor auto-publish {})",
+            value,
+            if enabled { "enabled" } else { "disabled" }
+        );
+        self.send_command(&cmd).await?;
+        info!("PublishHidServDescriptors set to {}", value);
+        Ok(())
+    }
+
     /// Get the number of established introduction points for our service
     ///
     /// Note: V3 descriptors have encrypted intro points, so we can't directly count them.
