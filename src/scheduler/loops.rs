@@ -920,6 +920,11 @@ async fn background_bootstrap_loop(
 /// 1. Is reported in heartbeats (intro_point_count)
 /// 2. Is broadcast to peers via IntroPoints messages
 /// 3. Is used by publisher to merge into the final descriptor
+///
+/// IMPORTANT: In the separate-node-addresses architecture, each node has its own
+/// unique .onion address (from node.hidden_service_dir). We fetch the descriptor
+/// for THIS NODE's address, not the master address. The master address only exists
+/// via our HSPOST publishing.
 async fn intro_point_refresh_loop(
     state: Arc<RwLock<RuntimeState>>,
     coordinator: Arc<RwLock<Coordinator>>,
@@ -929,17 +934,23 @@ async fn intro_point_refresh_loop(
     info!("Intro point refresh loop waiting 60 seconds for HS to establish...");
     tokio::time::sleep(Duration::from_secs(60)).await;
 
-    // Load master identity key for descriptor decryption
-    let identity = match crate::crypto::load_identity_key(&config.master.identity_key_path) {
+    // Load NODE's identity key (not master!) for descriptor decryption
+    // This is the key Tor uses for the node's unique .onion address
+    let node_key_path = std::path::Path::new(&config.node.hidden_service_dir)
+        .join("hs_ed25519_secret_key");
+    
+    let node_identity = match crate::crypto::load_identity_key(&node_key_path) {
         Ok(id) => id,
         Err(e) => {
             error!(
-                "Failed to load master identity key for intro point parsing: {}",
-                e
+                "Failed to load node identity key from {:?} for intro point parsing: {}",
+                node_key_path, e
             );
             return Err(e);
         },
     };
+
+    info!("Loaded node identity key for intro point parsing");
 
     let mut ticker = interval(Duration::from_secs(30)); // Check every 30 seconds
 
@@ -947,6 +958,20 @@ async fn intro_point_refresh_loop(
 
     loop {
         ticker.tick().await;
+
+        // Get the node's onion address from state (set during HS init)
+        let node_onion_address = {
+            let state = state.read().await;
+            state.node_onion_address.clone()
+        };
+
+        let node_addr = match node_onion_address {
+            Some(addr) => addr,
+            None => {
+                debug!("Node onion address not yet available, waiting...");
+                continue;
+            },
+        };
 
         // Connect to Tor control port
         let mut tor = match crate::tor::control::TorController::connect(&config.tor).await {
@@ -957,26 +982,24 @@ async fn intro_point_refresh_loop(
             },
         };
 
-        // Fetch our descriptor from Tor
-        let descriptor_raw = match tor
-            .get_own_hs_descriptor(&config.master.onion_address)
-            .await
-        {
+        // Fetch OUR NODE's descriptor (not master!) from Tor
+        // Tor publishes this automatically for the node's unique address
+        let descriptor_raw = match tor.get_own_hs_descriptor(&node_addr).await {
             Ok(Some(desc)) => desc,
             Ok(None) => {
-                debug!("No descriptor available yet for our service");
+                debug!("No descriptor available yet for node address {}", node_addr);
                 continue;
             },
             Err(e) => {
-                debug!("Failed to get our descriptor: {}", e);
+                debug!("Failed to get node descriptor: {}", e);
                 continue;
             },
         };
 
-        // Parse and decrypt the descriptor to extract intro points
+        // Parse and decrypt the descriptor using NODE's key
         let intro_points = match crate::tor::HsDescriptor::parse_and_decrypt_with_pubkey(
             &descriptor_raw,
-            identity.public_key(),
+            node_identity.public_key(),
         ) {
             Ok(desc) => desc.introduction_points,
             Err(e) => {
