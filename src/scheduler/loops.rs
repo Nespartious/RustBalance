@@ -40,13 +40,14 @@ pub async fn run(
         .map(|wg| !wg.peers.is_empty())
         .unwrap_or(false);
 
-    // Setup hidden service directory with master key (files only)
-    info!("Setting up hidden service directory...");
-    crate::balance::onion_service::setup_hs_directory(
-        &config.hidden_service_dir,
-        &config.master.identity_key_path,
-    )
-    .await?;
+    // In multi-node architecture, each node has its OWN unique .onion address.
+    // Tor auto-generates keys in node.hidden_service_dir (not master key).
+    // The publisher merges intro points from all nodes and HSPOSTs for master address.
+    // No need to copy master key to HS dir - Tor creates its own keypair.
+    info!(
+        "Node hidden service directory: {}",
+        config.node.hidden_service_dir
+    );
 
     // Create onion service manager
     let mut onion_service = OnionService::new(&config);
@@ -57,24 +58,27 @@ pub async fn run(
         info!("Joining node: Delaying HS config until after bootstrap");
     } else {
         info!("Init node: Configuring Tor hidden service...");
+        // Use node.hidden_service_dir - Tor will generate a UNIQUE keypair for this node
         onion_service
-            .configure_tor_hs(&config.hidden_service_dir, 80)
+            .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
         // Wait for Tor to create hostname file
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Read and verify hostname
-        match crate::balance::onion_service::read_hs_hostname(&config.hidden_service_dir).await {
+        // Read and store this node's unique hostname
+        // NOTE: In multi-node mode, this is DIFFERENT from master address - that's intentional!
+        // Publisher fetches each node's descriptor and merges intro points for master.
+        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
+            .await
+        {
             Ok(hostname) => {
-                info!("Hidden service hostname: {}", hostname);
-                if hostname != config.master.onion_address {
-                    warn!(
-                        "Hostname mismatch! Expected: {}, Got: {}",
-                        config.master.onion_address, hostname
-                    );
-                }
+                info!("This node's onion address: {}", hostname);
+                info!("Master address (for HSPOST): {}", config.master.onion_address);
+                // Store in state for intro point sharing
+                let mut state = state.write().await;
+                state.node_onion_address = Some(hostname);
             },
             Err(e) => {
                 error!("Failed to read hostname: {}", e);
@@ -161,24 +165,26 @@ pub async fn run(
 
         // NOW configure the hidden service (after bootstrap attempt)
         info!("Joining node: NOW configuring Tor hidden service...");
+        // Use node.hidden_service_dir - Tor will generate a UNIQUE keypair for this node
         onion_service
-            .configure_tor_hs(&config.hidden_service_dir, 80)
+            .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
         // Wait for Tor to create hostname file
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Read and verify hostname
-        match crate::balance::onion_service::read_hs_hostname(&config.hidden_service_dir).await {
+        // Read and store this node's unique hostname
+        // NOTE: In multi-node mode, this is DIFFERENT from master address - that's intentional!
+        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
+            .await
+        {
             Ok(hostname) => {
-                info!("Hidden service hostname: {}", hostname);
-                if hostname != config.master.onion_address {
-                    warn!(
-                        "Hostname mismatch! Expected: {}, Got: {}",
-                        config.master.onion_address, hostname
-                    );
-                }
+                info!("This node's onion address: {}", hostname);
+                info!("Master address (for HSPOST): {}", config.master.onion_address);
+                // Store in state for intro point sharing
+                let mut state = state.write().await;
+                state.node_onion_address = Some(hostname);
             },
             Err(e) => {
                 error!("Failed to read hostname: {}", e);

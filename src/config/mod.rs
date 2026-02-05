@@ -29,7 +29,9 @@ pub struct Config {
     /// Local port to listen for hidden service connections
     #[serde(default = "default_local_port")]
     pub local_port: u16,
-    /// Path for hidden service directory (where Tor stores keys)
+    /// DEPRECATED: Legacy hidden service directory field.
+    /// In multi-node mode, use node.hidden_service_dir instead.
+    /// This field is kept for backward compatibility but should not be used.
     #[serde(default = "default_hs_dir")]
     pub hidden_service_dir: String,
 }
@@ -44,6 +46,15 @@ pub struct NodeConfig {
     /// Clock skew tolerance in seconds
     #[serde(default = "default_clock_skew")]
     pub clock_skew_tolerance_secs: u64,
+    /// Node-specific hidden service directory (for this node's unique .onion address)
+    /// This is where Tor stores this node's keys and creates intro points.
+    /// Separate from master key dir - Tor auto-publishes for this address (not master).
+    #[serde(default = "default_node_hs_dir")]
+    pub hidden_service_dir: String,
+}
+
+fn default_node_hs_dir() -> String {
+    "/var/lib/tor/rustbalance_node_hs".to_string()
 }
 
 fn default_clock_skew() -> u64 {

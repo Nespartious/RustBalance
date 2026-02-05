@@ -23,6 +23,12 @@ fn validate_node(config: &Config) -> Result<()> {
     if config.node.id.len() > 64 {
         bail!("node.id too long (max 64 chars)");
     }
+    
+    // Validate node hidden_service_dir is non-empty
+    if config.node.hidden_service_dir.is_empty() {
+        bail!("node.hidden_service_dir cannot be empty");
+    }
+    
     Ok(())
 }
 

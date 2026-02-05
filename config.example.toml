@@ -22,7 +22,10 @@ id = "node-a"
 priority = 10
 clock_skew_tolerance_secs = 5
 # Node-specific hidden service directory
-# Each node has its own .onion address, publisher merges intro points
+# This is where Tor stores THIS NODE's unique .onion address keys.
+# In multi-node mode, each node has its own address. The publisher
+# fetches intro points from all nodes and merges them into the master descriptor.
+# IMPORTANT: Use /var/lib/tor/ to work with AppArmor policies
 hidden_service_dir = "/var/lib/tor/rustbalance_node_hs"
 
 # ============================================================
