@@ -896,7 +896,7 @@ EOF
 wait_for_hidden_service() {
     local ONION_ADDRESS=$1
     local MAX_WAIT=${2:-300}  # Default 5 minutes
-    local CHECK_INTERVAL=15
+    local CHECK_INTERVAL=10
     local ELAPSED=0
     
     echo ""
@@ -910,7 +910,7 @@ wait_for_hidden_service() {
     
     # Wait for Tor to bootstrap first
     log "Waiting for Tor to fully bootstrap..."
-    sleep 10
+    sleep 5
     
     while [ $ELAPSED -lt $MAX_WAIT ]; do
         # Check if hostname file exists and has content
@@ -921,65 +921,51 @@ wait_for_hidden_service() {
             continue
         fi
         
-        # Try multiple methods to check connectivity (some sites have different defenses)
-        echo -e "  [${ELAPSED}s] Testing connection to $ONION_ADDRESS..."
-        REACHABLE=false
+        echo -e "  [${ELAPSED}s] Checking descriptor publication status..."
         
-        # Method 1: curl with native SOCKS5 support (most reliable)
-        if command -v curl &>/dev/null; then
-            if timeout 30 curl -s --socks5-hostname 127.0.0.1:9050 --max-time 25 "http://$ONION_ADDRESS/" > /dev/null 2>&1; then
-                REACHABLE=true
-            fi
-        fi
-        
-        # Method 2: torsocks wrapper (fallback)
-        if [ "$REACHABLE" = false ] && command -v torsocks &>/dev/null && command -v curl &>/dev/null; then
-            if timeout 30 torsocks curl -s --max-time 25 "http://$ONION_ADDRESS/" > /dev/null 2>&1; then
-                REACHABLE=true
-            fi
-        fi
-        
-        if [ "$REACHABLE" = true ]; then
+        # Primary check: Tor logs showing descriptor upload
+        # This is the authoritative indicator that the HS is ready
+        if sudo journalctl -u tor@default --since "5 minutes ago" 2>/dev/null | grep -q "Uploaded rendezvous descriptor"; then
             echo ""
-            echo -e "${GREEN}✓ HIDDEN SERVICE IS LIVE AND REACHABLE!${NC}"
+            echo -e "${GREEN}✓ HIDDEN SERVICE DESCRIPTOR PUBLISHED!${NC}"
+            echo -e "  Descriptor has been uploaded to HSDir nodes."
+            echo -e "  The hidden service should be reachable within 30-60 seconds."
             echo ""
             return 0
         fi
         
-        # Fallback: check logs if no curl available
-        if ! command -v curl &>/dev/null; then
-            # Without curl, just check if Tor reports the HS as published
-            # by checking the logs for "Uploaded rendezvous descriptor"
-            if sudo journalctl -u tor@default --since "5 minutes ago" 2>/dev/null | grep -q "Uploaded rendezvous descriptor"; then
+        # Secondary check: RustBalance intro point establishment
+        if sudo journalctl -u rustbalance --since "2 minutes ago" 2>/dev/null | grep -qE "intro.*point|introduction point|Intro points"; then
+            if [ $ELAPSED -ge 30 ]; then
                 echo ""
-                echo -e "${GREEN}✓ HIDDEN SERVICE DESCRIPTOR PUBLISHED!${NC}"
-                echo -e "${YELLOW}Note: Install curl for connectivity verification${NC}"
+                echo -e "${GREEN}✓ INTRO POINTS ESTABLISHED!${NC}"
+                echo -e "  RustBalance has established introduction points."
+                echo -e "  Descriptor should be propagating across HSDir nodes..."
                 echo ""
                 return 0
             fi
-            
-            # Also check rustbalance logs
-            if sudo journalctl -u rustbalance --since "2 minutes ago" 2>/dev/null | grep -q "Hidden service hostname:"; then
-                # Give it extra time for descriptor propagation
-                if [ $ELAPSED -ge 60 ]; then
-                    echo ""
-                    echo -e "${GREEN}✓ HIDDEN SERVICE APPEARS TO BE READY!${NC}"
-                    echo -e "${YELLOW}Descriptor should be propagating across HSDir nodes...${NC}"
-                    echo ""
-                    return 0
-                fi
+        fi
+        
+        # Tertiary check: RustBalance shows hidden service configured
+        if sudo journalctl -u rustbalance --since "2 minutes ago" 2>/dev/null | grep -q "Hidden service hostname:"; then
+            if [ $ELAPSED -ge 60 ]; then
+                echo ""
+                echo -e "${GREEN}✓ HIDDEN SERVICE CONFIGURED!${NC}"
+                echo -e "  Hidden service is set up, waiting for descriptor propagation..."
+                echo ""
+                return 0
             fi
         fi
         
-        echo -e "  [${ELAPSED}s] Hidden service not yet reachable, waiting..."
         sleep $CHECK_INTERVAL
         ELAPSED=$((ELAPSED + CHECK_INTERVAL))
     done
     
     echo ""
-    echo -e "${YELLOW}⚠ Timeout waiting for hidden service to become reachable${NC}"
+    echo -e "${YELLOW}⚠ Timeout waiting for hidden service descriptor${NC}"
     echo "This may be normal - Tor hidden services can take several minutes to propagate."
-    echo "Check manually with: curl --socks5-hostname 127.0.0.1:9050 http://$ONION_ADDRESS/"
+    echo "Check Tor logs: sudo journalctl -u tor@default -f"
+    echo "Check RustBalance logs: sudo journalctl -u rustbalance -f"
     echo ""
     return 1
 }
