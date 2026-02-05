@@ -154,10 +154,14 @@ impl OnionService {
         }
         let join_handler = Arc::new(join_handler);
 
+        // Connection counter for logging
+        let connection_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         loop {
             match listener.accept().await {
                 Ok((client, addr)) => {
-                    debug!("Accepted connection from {}", addr);
+                    let count = connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    info!("Session #{}: New connection from {} -> proxying to {}", count, addr, self.target_address);
 
                     let target = self.target_address.clone();
                     let target_port = self.target_port;
