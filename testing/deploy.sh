@@ -35,7 +35,7 @@
 set -e
 
 REPO_URL="https://github.com/Nespartious/RustBalance.git"
-REPO_BRANCH="main"  # Branch to clone
+REPO_BRANCH="feature/separate-node-addresses"  # Branch to clone (testing feature branch)
 INSTALL_DIR="$HOME/rustbalance"
 CONFIG_DIR="/etc/rustbalance"
 # DEPRECATED: Legacy HS dir for master key (no longer used in multi-node mode)
