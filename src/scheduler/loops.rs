@@ -735,10 +735,6 @@ async fn publish_loop(
             );
         } else {
             // Multi-node mode with intro points: merge and publish
-            info!(
-                "Multi-node mode: merging {} own + {} peer intro points",
-                own_intro_count, peer_intro_count
-            );
 
             // NOTE: We intentionally DO NOT disable Tor's auto-publishing.
             // Setting PublishHidServDescriptors=0 causes Tor to stop maintaining
@@ -779,6 +775,20 @@ async fn publish_loop(
                     },
                 }
             }
+
+            // Log actual counts AFTER collecting/deserializing
+            // Note: peer_intro_count from heartbeats may differ from actual data received
+            let actual_peer_count = peer_intro_points.len();
+            if actual_peer_count != peer_intro_count {
+                warn!(
+                    "Peer intro point mismatch: heartbeat reports {} but we have {} actual data entries",
+                    peer_intro_count, actual_peer_count
+                );
+            }
+            info!(
+                "Multi-node mode: merging {} own + {} peer intro points (heartbeat reported {})",
+                own_intro_points.len(), actual_peer_count, peer_intro_count
+            );
 
             // 3. Merge intro points, capping at max
             let mut merged: Vec<crate::tor::IntroductionPoint> = own_intro_points;
@@ -1078,13 +1088,19 @@ async fn intro_point_refresh_loop(
             (current, current != new_count)
         };
 
-        if changed && new_count > 0 {
-            info!(
-                "Intro points updated: {} -> {} (parsed from descriptor)",
-                current_count, new_count
-            );
+        if new_count > 0 {
+            if changed {
+                info!(
+                    "Intro points updated: {} -> {} (parsed from descriptor)",
+                    current_count, new_count
+                );
+            }
 
             // Serialize intro points for broadcast
+            // NOTE: We broadcast on EVERY tick (not just on change) because:
+            // 1. A peer that restarts needs to receive our intro points
+            // 2. IntroPoints messages may be lost if peer tracker doesn't have us yet
+            // 3. Periodic broadcast ensures eventual consistency
             let intro_data: Vec<crate::coord::IntroPointData> = intro_points
                 .iter()
                 .map(|ip| crate::coord::IntroPointData {
@@ -1106,11 +1122,11 @@ async fn intro_point_refresh_loop(
                 }
             }
 
-            // Update local state
-            let mut state = state.write().await;
-            state.own_intro_points = intro_points;
-        } else if new_count > 0 && !changed {
-            debug!("Intro points stable at {}", new_count);
+            // Update local state if changed
+            if changed {
+                let mut state = state.write().await;
+                state.own_intro_points = intro_points;
+            }
         } else if current_count > 0 && new_count == 0 {
             warn!("Intro points dropped to 0 (was {})", current_count);
             let mut state = state.write().await;
