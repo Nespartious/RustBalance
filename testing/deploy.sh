@@ -38,9 +38,11 @@ REPO_URL="https://github.com/Nespartious/RustBalance.git"
 REPO_BRANCH="feature/separate-node-addresses"  # Branch to clone (testing feature branch)
 INSTALL_DIR="$HOME/rustbalance"
 CONFIG_DIR="/etc/rustbalance"
-# DEPRECATED: Legacy HS dir for master key (no longer used in multi-node mode)
+# DEPRECATED: Legacy HS dir path (kept for backward compatibility)
 HS_DIR="/var/lib/tor/rustbalance_hs"
-# Node-specific HS dir - Tor creates a UNIQUE address here for each node
+# Node HS directory - RustBalance writes the MASTER keys here before Tor starts.
+# This means ALL nodes run AS the master identity (same .onion address).
+# Tor will read these keys and use them for its hidden service.
 NODE_HS_DIR="/var/lib/tor/rustbalance_node_hs"
 LOG_FILE="$HOME/rustbalance_deploy.log"
 
@@ -345,8 +347,8 @@ setup_hs_directory() {
     sudo chown -R debian-tor:debian-tor "$HS_DIR"
     sudo chmod 700 "$HS_DIR"
     
-    # Create node-specific HS directory - Tor will generate a UNIQUE keypair here
-    # This gives each node its own .onion address, separate from the master
+    # Create node HS directory - RustBalance writes MASTER keys here before Tor starts.
+    # This makes all nodes run AS the master identity (same .onion address).
     sudo mkdir -p "$NODE_HS_DIR"
     sudo chown -R debian-tor:debian-tor "$NODE_HS_DIR"
     sudo chmod 700 "$NODE_HS_DIR"
@@ -573,8 +575,8 @@ hidden_service_dir = "/var/lib/tor/rustbalance_hs"
 id = "$NODE_ID"
 priority = $NODE_PRIORITY
 clock_skew_tolerance_secs = 5
-# Node-specific HS directory - Tor generates a UNIQUE address here
-# Each node has its own .onion, publisher merges intro points for master
+# Node HS directory - RustBalance writes MASTER keys here before Tor starts.
+# This makes all nodes run AS the master identity (same .onion address).
 hidden_service_dir = "/var/lib/tor/rustbalance_node_hs"
 
 [master]
@@ -819,8 +821,8 @@ hidden_service_dir = "/var/lib/tor/rustbalance_hs"
 id = "$NODE_ID"
 priority = $NODE_PRIORITY
 clock_skew_tolerance_secs = 5
-# Node-specific HS directory - Tor generates a UNIQUE address here
-# Each node has its own .onion, publisher merges intro points for master
+# Node HS directory - RustBalance writes MASTER keys here before Tor starts.
+# This makes all nodes run AS the master identity (same .onion address).
 hidden_service_dir = "/var/lib/tor/rustbalance_node_hs"
 
 [master]
@@ -935,9 +937,9 @@ wait_for_hidden_service() {
     sleep 5
     
     while [ $ELAPSED -lt $MAX_WAIT ]; do
-        # Check if hostname file exists and has content (in node HS dir, not legacy)
+        # Check if hostname file exists (RustBalance writes master keys here)
         if [ ! -f "$NODE_HS_DIR/hostname" ]; then
-            echo -e "  [${ELAPSED}s] Waiting for node hostname file..."
+            echo -e "  [${ELAPSED}s] Waiting for hostname file..."
             sleep $CHECK_INTERVAL
             ELAPSED=$((ELAPSED + CHECK_INTERVAL))
             continue
@@ -1011,14 +1013,16 @@ start_and_verify() {
     log "RustBalance service is running"
     
     # Wait for the hidden service to be configured
-    # In multi-node mode, Tor creates the NODE's unique address in NODE_HS_DIR
-    log "Waiting for Tor to configure node hidden service..."
+    # With the new architecture, all nodes run AS the master identity.
+    # RustBalance writes master keys to NODE_HS_DIR before Tor starts.
+    # The hostname file should contain the MASTER address, not a unique node address.
+    log "Waiting for Tor to configure hidden service..."
     local WAITED=0
     while [ $WAITED -lt 60 ]; do
         if [ -f "$NODE_HS_DIR/hostname" ]; then
             NODE_ONION=$(sudo cat "$NODE_HS_DIR/hostname" 2>/dev/null)
             if [ -n "$NODE_ONION" ]; then
-                log "This node's onion address: $NODE_ONION"
+                log "Hidden service address: $NODE_ONION"
                 
                 # Update config with master onion if it's still PENDING
                 # (master onion is derived from master key, not from hostname file)
@@ -1078,10 +1082,10 @@ show_status() {
         echo "Master onion (config): $MASTER_ONION_CFG"
     fi
     
-    # In multi-node mode, node address is different from master
+    # With new architecture, node address = master address (all nodes run AS master)
     if [ -f "$NODE_HS_DIR/hostname" ]; then
         NODE_ONION=$(sudo cat "$NODE_HS_DIR/hostname" 2>/dev/null || echo "not yet generated")
-        echo -e "This node's .onion:  ${GREEN}$NODE_ONION${NC}"
+        echo -e "HS address (should match master): ${GREEN}$NODE_ONION${NC}"
     fi
     echo ""
     
