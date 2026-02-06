@@ -38,6 +38,13 @@ data-encoding = "2.5"         # For base32 (onion addresses)
 # Networking
 socket2 = "0.5"
 
+# HTTP client/server for reverse proxy
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "stream"] }
+hyper = { version = "1.4", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1.5"
+
 # Time handling
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 

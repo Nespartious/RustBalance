@@ -25,6 +25,8 @@ pub struct OnionService {
     target_port: u16,
     /// Tor SOCKS port for outbound connections
     socks_port: u16,
+    /// Master onion address (for response header rewriting)
+    master_address: String,
     /// Join secret for the Tor Bootstrap Channel (if enabled)
     join_secret: Option<String>,
     /// Cluster token for validating join requests
@@ -54,6 +56,7 @@ impl OnionService {
             target_address: config.target.onion_address.clone(),
             target_port: config.target.port,
             socks_port: config.tor.socks_port,
+            master_address: config.master.onion_address.clone(),
             join_secret: config.coordination.join_secret.clone(),
             cluster_token: config.coordination.cluster_token.clone(),
             peers: None,
@@ -166,6 +169,7 @@ impl OnionService {
                     let target = self.target_address.clone();
                     let target_port = self.target_port;
                     let socks_port = self.socks_port;
+                    let master = self.master_address.clone();
                     let handler = Arc::clone(&join_handler);
 
                     tokio::spawn(async move {
@@ -174,6 +178,7 @@ impl OnionService {
                             &target,
                             target_port,
                             socks_port,
+                            &master,
                             handler,
                         )
                         .await
@@ -215,6 +220,7 @@ impl OnionService {
         target: &str,
         target_port: u16,
         socks_port: u16,
+        master_address: &str,
         join_handler: Arc<Option<JoinHandler>>,
     ) -> Result<()> {
         // Peek at the first line to check if this is a join request
@@ -248,7 +254,7 @@ impl OnionService {
         }
 
         // Not a join request - proxy normally
-        Self::handle_connection(client, target, target_port, socks_port).await
+        Self::handle_connection(client, target, target_port, socks_port, master_address).await
     }
 
     /// Handle a single proxied connection
@@ -257,6 +263,7 @@ impl OnionService {
         target: &str,
         target_port: u16,
         socks_port: u16,
+        master_address: &str,
     ) -> Result<()> {
         // Connect to target via Tor SOCKS5
         let mut socks = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
@@ -311,18 +318,20 @@ impl OnionService {
         debug!("SOCKS5 connection established to {}", domain);
 
         // Now proxy with Host header rewriting
-        Self::proxy_with_host_rewrite(client, socks, &domain, target_port).await
+        Self::proxy_with_host_rewrite(client, socks, &domain, target_port, master_address).await
     }
 
     /// Proxy connection with HTTP Host header rewriting
     ///
     /// Many sites (like Dread) require the correct Host header.
     /// We rewrite it from the master onion to the target onion.
+    /// Also rewrites Location and Set-Cookie headers in responses.
     async fn proxy_with_host_rewrite(
         mut client: TcpStream,
         mut socks: TcpStream,
         target_host: &str,
         target_port: u16,
+        master_address: &str,
     ) -> Result<()> {
         let target_with_port = if target_port == 80 {
             target_host.to_string()
@@ -343,9 +352,11 @@ impl OnionService {
             Self::forward_requests_with_rewrite(&mut client_reader, &mut socks_write, &target_for_task).await
         };
 
-        // Spawn task to forward responses server -> client (no modification needed)
+        // Spawn task to forward responses server -> client WITH header rewriting
+        let master_for_task = master_address.to_string();
+        let target_for_response = target_host.to_string();
         let response_forwarder = async move {
-            Self::forward_responses(&mut socks_reader, &mut client_write).await
+            Self::forward_responses_with_rewrite(&mut socks_reader, &mut client_write, &target_for_response, &master_for_task).await
         };
 
         tokio::select! {
@@ -452,8 +463,128 @@ impl OnionService {
         }
     }
 
-    /// Forward responses from server to client without modification
-    async fn forward_responses<R, W>(
+    /// Forward HTTP responses from server to client, rewriting Location and Set-Cookie headers
+    ///
+    /// This is critical for proper reverse proxy behavior:
+    /// - Location headers must be rewritten so redirects stay on master address
+    /// - Set-Cookie Domain= attributes must be stripped so cookies work
+    async fn forward_responses_with_rewrite<R, W>(
+        reader: &mut tokio::io::BufReader<R>,
+        writer: &mut W,
+        target_host: &str,
+        master_address: &str,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        loop {
+            // Read the status line
+            let mut status_line = String::new();
+            let n = reader.read_line(&mut status_line).await?;
+            if n == 0 {
+                return Ok(()); // Connection closed
+            }
+
+            // Check if this looks like an HTTP response
+            let is_http_response = status_line.starts_with("HTTP/");
+
+            if !is_http_response {
+                // Not HTTP, just forward and continue with raw copy
+                writer.write_all(status_line.as_bytes()).await?;
+                tokio::io::copy(reader, writer).await?;
+                return Ok(());
+            }
+
+            // Write status line unchanged
+            writer.write_all(status_line.as_bytes()).await?;
+
+            // Read and process headers
+            let mut content_length: Option<usize> = None;
+            let mut is_chunked = false;
+
+            loop {
+                let mut header_line = String::new();
+                let n = reader.read_line(&mut header_line).await?;
+                if n == 0 {
+                    return Ok(()); // Connection closed
+                }
+
+                // Check for end of headers
+                if header_line == "\r\n" || header_line == "\n" {
+                    writer.write_all(header_line.as_bytes()).await?;
+                    break;
+                }
+
+                let lower = header_line.to_lowercase();
+
+                // Rewrite Location header
+                if lower.starts_with("location:") {
+                    let new_header = Self::rewrite_location(&header_line, target_host, master_address);
+                    debug!("Rewrote Location header: {} -> {}", header_line.trim(), new_header.trim());
+                    writer.write_all(new_header.as_bytes()).await?;
+                }
+                // Rewrite Set-Cookie header
+                else if lower.starts_with("set-cookie:") {
+                    let new_header = Self::rewrite_cookie(&header_line);
+                    if new_header != header_line {
+                        debug!("Rewrote Set-Cookie header");
+                    }
+                    writer.write_all(new_header.as_bytes()).await?;
+                }
+                // Track Content-Length
+                else if lower.starts_with("content-length:") {
+                    if let Some(len_str) = header_line.split(':').nth(1) {
+                        content_length = Some(len_str.trim().parse().unwrap_or(0));
+                    }
+                    writer.write_all(header_line.as_bytes()).await?;
+                }
+                // Track Transfer-Encoding: chunked
+                else if lower.starts_with("transfer-encoding:") {
+                    if lower.contains("chunked") {
+                        is_chunked = true;
+                    }
+                    writer.write_all(header_line.as_bytes()).await?;
+                }
+                else {
+                    writer.write_all(header_line.as_bytes()).await?;
+                }
+            }
+
+            writer.flush().await?;
+
+            // Forward response body
+            if is_chunked {
+                // Handle chunked transfer encoding
+                Self::forward_chunked_body(reader, writer).await?;
+            } else if let Some(len) = content_length {
+                if len > 0 {
+                    // Fixed-length body
+                    let mut remaining = len;
+                    let mut buf = vec![0u8; 8192.min(remaining)];
+                    while remaining > 0 {
+                        let to_read = buf.len().min(remaining);
+                        use tokio::io::AsyncReadExt;
+                        let n = reader.read(&mut buf[..to_read]).await?;
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        writer.write_all(&buf[..n]).await?;
+                        remaining -= n;
+                    }
+                }
+            }
+            // If neither chunked nor content-length, continue to next response
+            // (HTTP/1.1 keep-alive or empty body)
+
+            writer.flush().await?;
+        }
+    }
+
+    /// Forward a chunked transfer-encoded body
+    async fn forward_chunked_body<R, W>(
         reader: &mut tokio::io::BufReader<R>,
         writer: &mut W,
     ) -> Result<()>
@@ -461,12 +592,130 @@ impl OnionService {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        // Just copy everything - responses don't need modification
-        tokio::io::copy(reader, writer).await?;
-        writer.flush().await?;
+        loop {
+            // Read chunk size line
+            let mut size_line = String::new();
+            let n = reader.read_line(&mut size_line).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            
+            // Parse chunk size (hex)
+            let size_str = size_line.trim().split(';').next().unwrap_or("0");
+            let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+            
+            // Write chunk size line
+            writer.write_all(size_line.as_bytes()).await?;
+            
+            if chunk_size == 0 {
+                // Last chunk - read and forward trailing CRLF
+                let mut trailer = String::new();
+                reader.read_line(&mut trailer).await?;
+                writer.write_all(trailer.as_bytes()).await?;
+                break;
+            }
+            
+            // Read and forward chunk data
+            let mut remaining = chunk_size;
+            let mut buf = vec![0u8; 8192.min(remaining)];
+            while remaining > 0 {
+                let to_read = buf.len().min(remaining);
+                use tokio::io::AsyncReadExt;
+                let n = reader.read(&mut buf[..to_read]).await?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..n]).await?;
+                remaining -= n;
+            }
+            
+            // Read and forward trailing CRLF
+            let mut crlf = String::new();
+            reader.read_line(&mut crlf).await?;
+            writer.write_all(crlf.as_bytes()).await?;
+        }
+        
         Ok(())
+    }
+
+    /// Rewrite Location header to use master address instead of target
+    ///
+    /// Converts URLs like:
+    /// - http://target.onion/path -> /path (relative)
+    /// - https://target.onion/path -> /path (relative)
+    /// - http://target.onion:8080/path -> /path (relative)
+    fn rewrite_location(header: &str, target_host: &str, _master_address: &str) -> String {
+        // Extract the URL from "Location: URL"
+        let parts: Vec<&str> = header.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return header.to_string();
+        }
+        
+        let url = parts[1].trim();
+        
+        // Target without .onion suffix for matching
+        let target_base = target_host.trim_end_matches(".onion");
+        
+        // Check if URL points to the target
+        // Handle http://target.onion, https://target.onion, target.onion
+        for prefix in &[
+            format!("http://{}.onion", target_base),
+            format!("https://{}.onion", target_base),
+            format!("http://{}:80", target_host),
+            format!("https://{}:443", target_host),
+            target_host.to_string(),
+        ] {
+            if url.starts_with(prefix) {
+                // Extract path after the host
+                let remainder = &url[prefix.len()..];
+                let path = if remainder.is_empty() || remainder == "/" {
+                    "/".to_string()
+                } else if remainder.starts_with('/') {
+                    remainder.to_string()
+                } else if remainder.starts_with(':') {
+                    // Port number - find the path after
+                    if let Some(slash_pos) = remainder.find('/') {
+                        remainder[slash_pos..].to_string()
+                    } else {
+                        "/".to_string()
+                    }
+                } else {
+                    format!("/{}", remainder)
+                };
+                
+                // Return relative path (browser will resolve against current origin)
+                return format!("Location: {}\r\n", path);
+            }
+        }
+        
+        // Not a target URL, pass through unchanged
+        header.to_string()
+    }
+
+    /// Rewrite Set-Cookie header to remove Domain= attribute
+    ///
+    /// Removes Domain= so cookies are scoped to the master address
+    fn rewrite_cookie(header: &str) -> String {
+        // Split into parts by ;
+        let parts: Vec<&str> = header.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return header.to_string();
+        }
+        
+        let cookie_parts: Vec<&str> = parts[1].split(';').collect();
+        let mut new_parts: Vec<&str> = Vec::new();
+        
+        for part in cookie_parts {
+            let trimmed = part.trim().to_lowercase();
+            // Skip Domain= attribute
+            if !trimmed.starts_with("domain=") {
+                new_parts.push(part);
+            }
+        }
+        
+        format!("Set-Cookie:{}\r\n", new_parts.join(";").trim_end())
     }
 }
 
