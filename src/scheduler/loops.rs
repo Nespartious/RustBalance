@@ -627,6 +627,9 @@ async fn publish_loop(
     // Max intro points per descriptor (Tor spec limit)
     let max_intro_points = 20;
 
+    // Track whether Tor's auto-publish is disabled (for multi-node mode)
+    let mut auto_publish_disabled = false;
+
     loop {
 
         // Auto-detect mode: check if we have active peers
@@ -699,6 +702,24 @@ async fn publish_loop(
             // our descriptor takes precedence.
             info!("Single-node mode: publishing descriptor for master address via HSPOST");
 
+            // Re-enable Tor auto-publish if it was previously disabled (transition from multi → single)
+            if auto_publish_disabled {
+                info!("Single-node mode: re-enabling Tor auto-publish");
+                match crate::tor::control::TorController::connect(&config.tor).await {
+                    Ok(mut tor) => {
+                        if let Err(e) = tor.set_publish_descriptors(true).await {
+                            warn!("Failed to re-enable Tor auto-publish: {}", e);
+                        } else {
+                            auto_publish_disabled = false;
+                            info!("Tor auto-publish re-enabled for single-node mode");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to connect to Tor to re-enable auto-publish: {}", e);
+                    },
+                }
+            }
+
             // Get our own intro points
             let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
                 let state = state.read().await;
@@ -740,12 +761,28 @@ async fn publish_loop(
         } else {
             // Multi-node mode with intro points: merge and publish
 
-            // NOTE: We intentionally DO NOT disable Tor's auto-publishing.
-            // Setting PublishHidServDescriptors=0 causes Tor to stop maintaining
-            // intro point circuits, which kills our intro points.
-            // Instead, we let Tor publish its descriptor normally, but our merged
-            // descriptor uses revision_counter = timestamp * 3, which is always
-            // higher than Tor's ~timestamp * 2.7, so HSDirs will prefer our version.
+            // CRITICAL: Disable Tor's auto-publishing in multi-node mode.
+            // Tor's service subsystem runs upload_descriptor_to_hsdir() every second,
+            // which uses OPE-encrypted revision counters that monotonically increase.
+            // This constantly overwrites our HSPOST descriptor on HSDirs.
+            // PublishHidServDescriptors=0 only stops descriptor UPLOADS to HSDirs;
+            // intro point circuits continue to be maintained normally.
+            if !auto_publish_disabled {
+                info!("Multi-node mode: disabling Tor auto-publish to prevent HSPOST race");
+                match crate::tor::control::TorController::connect(&config.tor).await {
+                    Ok(mut tor) => {
+                        if let Err(e) = tor.set_publish_descriptors(false).await {
+                            warn!("Failed to disable Tor auto-publish: {}", e);
+                        } else {
+                            auto_publish_disabled = true;
+                            info!("Tor auto-publish disabled successfully");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to connect to Tor to disable auto-publish: {}", e);
+                    },
+                }
+            }
 
             // 1. Collect own intro points
             let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
