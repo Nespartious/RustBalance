@@ -40,14 +40,28 @@ pub async fn run(
         .map(|wg| !wg.peers.is_empty())
         .unwrap_or(false);
 
-    // In multi-node architecture, each node has its OWN unique .onion address.
-    // Tor auto-generates keys in node.hidden_service_dir (not master key).
-    // The publisher merges intro points from all nodes and HSPOSTs for master address.
-    // No need to copy master key to HS dir - Tor creates its own keypair.
+    // CRITICAL: Write the master key to the HiddenServiceDir BEFORE configuring Tor.
+    // This ensures Tor uses the master's identity, not a randomly generated one.
+    // When clients connect to the master address, Tor needs the master's keys to
+    // decrypt INTRODUCE2 cells. Without this, connections will fail.
     info!(
         "Node hidden service directory: {}",
         config.node.hidden_service_dir
     );
+    
+    // Load master identity and write its keys to the HS directory
+    let master_identity = crate::crypto::load_identity_key(
+        std::path::Path::new(&config.master.identity_key_path)
+    )?;
+    
+    info!(
+        "Writing master key to HS directory: {}",
+        config.node.hidden_service_dir
+    );
+    crate::crypto::write_tor_key_files(
+        &master_identity,
+        std::path::Path::new(&config.node.hidden_service_dir),
+    )?;
 
     // Create onion service manager
     let mut onion_service = OnionService::new(&config);
@@ -58,24 +72,29 @@ pub async fn run(
         info!("Joining node: Delaying HS config until after bootstrap");
     } else {
         info!("Init node: Configuring Tor hidden service...");
-        // Use node.hidden_service_dir - Tor will generate a UNIQUE keypair for this node
+        // Tor will use the master keys we just wrote to the directory
         onion_service
             .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
-        // Wait for Tor to create hostname file
+        // Wait for Tor to create intro points
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Read and store this node's unique hostname
-        // NOTE: In multi-node mode, this is DIFFERENT from master address - that's intentional!
-        // Publisher fetches each node's descriptor and merges intro points for master.
+        // Verify hostname matches master address
         match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
             .await
         {
             Ok(hostname) => {
-                info!("This node's onion address: {}", hostname);
-                info!("Master address (for HSPOST): {}", config.master.onion_address);
+                info!("Tor HS address: {}", hostname);
+                info!("Master address: {}", config.master.onion_address);
+                // Verify they match (the node should be running AS the master address)
+                if !hostname.starts_with(&config.master.onion_address.replace(".onion", "")) {
+                    warn!(
+                        "HS address mismatch! Expected {}, got {}. Key write may have failed.",
+                        config.master.onion_address, hostname
+                    );
+                }
                 // Store in state for intro point sharing
                 let mut state = state.write().await;
                 state.node_onion_address = Some(hostname);
@@ -165,23 +184,29 @@ pub async fn run(
 
         // NOW configure the hidden service (after bootstrap attempt)
         info!("Joining node: NOW configuring Tor hidden service...");
-        // Use node.hidden_service_dir - Tor will generate a UNIQUE keypair for this node
+        // Tor will use the master keys we wrote earlier
         onion_service
             .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
-        // Wait for Tor to create hostname file
+        // Wait for Tor to create intro points
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Read and store this node's unique hostname
-        // NOTE: In multi-node mode, this is DIFFERENT from master address - that's intentional!
+        // Verify hostname matches master address
         match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
             .await
         {
             Ok(hostname) => {
-                info!("This node's onion address: {}", hostname);
-                info!("Master address (for HSPOST): {}", config.master.onion_address);
+                info!("Tor HS address: {}", hostname);
+                info!("Master address: {}", config.master.onion_address);
+                // Verify they match (the node should be running AS the master address)
+                if !hostname.starts_with(&config.master.onion_address.replace(".onion", "")) {
+                    warn!(
+                        "HS address mismatch! Expected {}, got {}. Key write may have failed.",
+                        config.master.onion_address, hostname
+                    );
+                }
                 // Store in state for intro point sharing
                 let mut state = state.write().await;
                 state.node_onion_address = Some(hostname);
@@ -664,10 +689,11 @@ async fn publish_loop(
         let total_intro_count = own_intro_count + peer_intro_count;
 
         if !has_active_peers {
-            // Single-node mode: We STILL need to HSPOST for the master address
-            // because Tor only auto-publishes for the node's own address, not master.
-            // In the new architecture, each node has a unique address, so we must
-            // explicitly publish for the master address.
+            // Single-node mode: Tor auto-publishes for master address since we
+            // injected the master key into HiddenServiceDir. However, we still
+            // HSPOST to ensure descriptor freshness and to allow seamless
+            // transition when peers join. Using higher revision counter ensures
+            // our descriptor takes precedence.
             info!("Single-node mode: publishing descriptor for master address via HSPOST");
 
             // Get our own intro points
@@ -952,10 +978,10 @@ async fn background_bootstrap_loop(
 /// 2. Is broadcast to peers via IntroPoints messages
 /// 3. Is used by publisher to merge into the final descriptor
 ///
-/// IMPORTANT: In the separate-node-addresses architecture, each node has its own
-/// unique .onion address (from node.hidden_service_dir). We fetch the descriptor
-/// for THIS NODE's address, not the master address. The master address only exists
-/// via our HSPOST publishing.
+/// IMPORTANT: In the unified-master-key architecture, each node runs as the master
+/// address. The master key is written to node.hidden_service_dir before Tor starts,
+/// so Tor creates intro points for the master address. We fetch the descriptor
+/// for the master address to get the intro points Tor created.
 async fn intro_point_refresh_loop(
     state: Arc<RwLock<RuntimeState>>,
     coordinator: Arc<RwLock<Coordinator>>,
@@ -965,23 +991,23 @@ async fn intro_point_refresh_loop(
     info!("Intro point refresh loop waiting 60 seconds for HS to establish...");
     tokio::time::sleep(Duration::from_secs(60)).await;
 
-    // Load NODE's identity key (not master!) for descriptor decryption
-    // This is the key Tor uses for the node's unique .onion address
+    // Load master identity key for descriptor decryption
+    // This is the same key that Tor is using (we wrote it to HS dir at startup)
     let node_key_path = std::path::Path::new(&config.node.hidden_service_dir)
         .join("hs_ed25519_secret_key");
     
-    let node_identity = match crate::crypto::load_identity_key(&node_key_path) {
+    let master_identity = match crate::crypto::load_identity_key(&node_key_path) {
         Ok(id) => id,
         Err(e) => {
             error!(
-                "Failed to load node identity key from {:?} for intro point parsing: {}",
+                "Failed to load master identity key from {:?} for intro point parsing: {}",
                 node_key_path, e
             );
             return Err(e);
         },
     };
 
-    info!("Loaded node identity key for intro point parsing");
+    info!("Loaded master identity key for intro point parsing");
 
     let mut ticker = interval(Duration::from_secs(30)); // Check every 30 seconds
 
@@ -990,16 +1016,16 @@ async fn intro_point_refresh_loop(
     loop {
         ticker.tick().await;
 
-        // Get the node's onion address from state (set during HS init)
+        // Get the onion address from state (should be master address after HS init)
         let node_onion_address = {
             let state = state.read().await;
             state.node_onion_address.clone()
         };
 
-        let node_addr = match node_onion_address {
+        let addr = match node_onion_address {
             Some(addr) => addr,
             None => {
-                debug!("Node onion address not yet available, waiting...");
+                debug!("Onion address not yet available, waiting...");
                 continue;
             },
         };
@@ -1013,24 +1039,24 @@ async fn intro_point_refresh_loop(
             },
         };
 
-        // Fetch OUR NODE's descriptor (not master!) from Tor
-        // Tor publishes this automatically for the node's unique address
-        let descriptor_raw = match tor.get_own_hs_descriptor(&node_addr).await {
+        // Fetch the descriptor from Tor (this is the master address descriptor)
+        // Tor auto-publishes this since it has the master key in HiddenServiceDir
+        let descriptor_raw = match tor.get_own_hs_descriptor(&addr).await {
             Ok(Some(desc)) => desc,
             Ok(None) => {
-                debug!("No descriptor available yet for node address {}", node_addr);
+                debug!("No descriptor available yet for {}", addr);
                 continue;
             },
             Err(e) => {
-                debug!("Failed to get node descriptor: {}", e);
+                debug!("Failed to get descriptor: {}", e);
                 continue;
             },
         };
 
-        // Parse and decrypt the descriptor using NODE's key
+        // Parse and decrypt the descriptor using master key
         let intro_points = match crate::tor::HsDescriptor::parse_and_decrypt_with_pubkey(
             &descriptor_raw,
-            node_identity.public_key(),
+            master_identity.public_key(),
         ) {
             Ok(desc) => desc.introduction_points,
             Err(e) => {

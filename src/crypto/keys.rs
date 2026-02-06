@@ -357,6 +357,99 @@ pub fn pubkey_from_onion_address(onion_addr: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&key_array).context("Invalid ed25519 public key in onion address")
 }
 
+/// Set restrictive permissions on a file (Unix only)
+#[cfg(unix)]
+fn set_restrictive_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+/// Set restrictive permissions on a file (no-op on Windows)
+#[cfg(not(unix))]
+fn set_restrictive_permissions(_path: &std::path::Path) -> Result<()> {
+    // On Windows, file permissions work differently
+    // The file is already created with default permissions
+    Ok(())
+}
+
+/// Write Tor-format key files to a hidden service directory
+///
+/// Creates:
+/// - hs_ed25519_secret_key: 32-byte header + 64-byte expanded key
+/// - hs_ed25519_public_key: 32-byte header + 32-byte public key
+/// - hostname: the .onion address
+///
+/// This allows RustBalance to inject the master key into the HiddenServiceDir
+/// before Tor starts, so Tor uses the master's identity instead of generating a new one.
+pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) -> Result<()> {
+    use std::fs;
+    
+    // Create directory if it doesn't exist
+    fs::create_dir_all(hs_dir)
+        .with_context(|| format!("Failed to create HS directory: {:?}", hs_dir))?;
+    
+    // === Write secret key file ===
+    // Format: "== ed25519v1-secret: type0 ==" (32 bytes, null-padded) + 64-byte expanded key
+    let secret_path = hs_dir.join("hs_ed25519_secret_key");
+    
+    let mut secret_data = Vec::with_capacity(96);
+    
+    // Header: "== ed25519v1-secret: type0 ==" null-padded to 32 bytes
+    let header = b"== ed25519v1-secret: type0 ==";
+    secret_data.extend_from_slice(header);
+    // Pad with zeros to 32 bytes
+    secret_data.resize(32, 0);
+    
+    // Expanded key: clamped private scalar (32 bytes) + PRF secret (32 bytes)
+    secret_data.extend_from_slice(identity.private_scalar());
+    secret_data.extend_from_slice(identity.prf_secret());
+    
+    fs::write(&secret_path, &secret_data)
+        .with_context(|| format!("Failed to write secret key: {:?}", secret_path))?;
+    
+    // Set permissions to 600 (Unix only)
+    set_restrictive_permissions(&secret_path)?;
+    
+    tracing::info!("Wrote hs_ed25519_secret_key to {:?}", secret_path);
+    
+    // === Write public key file ===
+    // Format: "== ed25519v1-public: type0 ==" (32 bytes, null-padded) + 32-byte public key
+    let public_path = hs_dir.join("hs_ed25519_public_key");
+    
+    let mut public_data = Vec::with_capacity(64);
+    
+    // Header
+    let pub_header = b"== ed25519v1-public: type0 ==";
+    public_data.extend_from_slice(pub_header);
+    public_data.resize(32, 0);
+    
+    // Public key
+    public_data.extend_from_slice(&identity.public_key_bytes());
+    
+    fs::write(&public_path, &public_data)
+        .with_context(|| format!("Failed to write public key: {:?}", public_path))?;
+    
+    set_restrictive_permissions(&public_path)?;
+    
+    tracing::info!("Wrote hs_ed25519_public_key to {:?}", public_path);
+    
+    // === Write hostname file ===
+    let hostname_path = hs_dir.join("hostname");
+    let onion_addr = identity.onion_address();
+    
+    fs::write(&hostname_path, format!("{}\n", onion_addr))
+        .with_context(|| format!("Failed to write hostname: {:?}", hostname_path))?;
+    
+    set_restrictive_permissions(&hostname_path)?;
+    
+    tracing::info!("Wrote hostname {} to {:?}", onion_addr, hostname_path);
+    
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
