@@ -346,11 +346,16 @@ impl OnionService {
         use rustls::RootCertStore;
         use std::convert::TryFrom;
 
-        // Build TLS config with webpki roots
+        // Build TLS config with webpki roots and ring crypto provider
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let tls_config = rustls::ClientConfig::builder()
+        // Use ring as the crypto provider (required for rustls 0.23+)
+        let tls_config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into()
+        )
+            .with_safe_default_protocol_versions()
+            .context("Failed to set TLS protocol versions")?
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
