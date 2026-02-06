@@ -675,6 +675,7 @@ async fn publish_loop(
 
         if !is_publisher {
             debug!("Not publisher, skipping publish");
+            ticker.tick().await;
             continue;
         }
 
@@ -706,6 +707,7 @@ async fn publish_loop(
 
             if own_intro_points.is_empty() {
                 debug!("No intro points yet, waiting...");
+                ticker.tick().await;
                 continue;
             }
 

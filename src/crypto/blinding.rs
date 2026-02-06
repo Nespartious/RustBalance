@@ -219,6 +219,15 @@ pub fn current_time_period() -> u64 {
     offset_minutes / TIME_PERIOD_LENGTH_MINUTES
 }
 
+/// Get both the current and next time period numbers
+///
+/// Per rend-spec-v3 §2.2.1: "A service MUST generate and upload descriptors
+/// for the current and the following time period."
+pub fn current_and_next_time_periods() -> (u64, u64) {
+    let tp = current_time_period();
+    (tp, tp + 1)
+}
+
 /// Calculate time until next period boundary
 pub fn time_until_next_period() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
