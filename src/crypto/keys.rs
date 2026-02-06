@@ -367,11 +367,49 @@ fn set_restrictive_permissions(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Set ownership to debian-tor user (Unix only)
+/// Tor requires its hidden service directory and files to be owned by the tor user
+#[cfg(unix)]
+fn set_tor_ownership(path: &std::path::Path) -> Result<()> {
+    use std::process::Command;
+    
+    // Try to chown to debian-tor (Debian/Ubuntu) or _tor (macOS) or tor (other)
+    let users_to_try = ["debian-tor", "_tor", "tor"];
+    
+    for user in users_to_try {
+        let result = Command::new("chown")
+            .arg(format!("{}:{}", user, user))
+            .arg(path)
+            .output();
+        
+        if let Ok(output) = result {
+            if output.status.success() {
+                tracing::debug!("Set ownership of {:?} to {}", path, user);
+                return Ok(());
+            }
+        }
+    }
+    
+    // If we couldn't set ownership, log a warning but don't fail
+    // This might happen if running as non-root
+    tracing::warn!(
+        "Could not set Tor ownership on {:?}. Tor may regenerate keys.",
+        path
+    );
+    Ok(())
+}
+
 /// Set restrictive permissions on a file (no-op on Windows)
 #[cfg(not(unix))]
 fn set_restrictive_permissions(_path: &std::path::Path) -> Result<()> {
     // On Windows, file permissions work differently
     // The file is already created with default permissions
+    Ok(())
+}
+
+/// Set ownership to Tor user (no-op on Windows)
+#[cfg(not(unix))]
+fn set_tor_ownership(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
@@ -390,6 +428,16 @@ pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) 
     // Create directory if it doesn't exist
     fs::create_dir_all(hs_dir)
         .with_context(|| format!("Failed to create HS directory: {:?}", hs_dir))?;
+    
+    // Set directory permissions to 700 and ownership to Tor user
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(hs_dir)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(hs_dir, perms)?;
+    }
+    set_tor_ownership(hs_dir)?;
     
     // === Write secret key file ===
     // Format: "== ed25519v1-secret: type0 ==" (32 bytes, null-padded) + 64-byte expanded key
@@ -410,8 +458,9 @@ pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) 
     fs::write(&secret_path, &secret_data)
         .with_context(|| format!("Failed to write secret key: {:?}", secret_path))?;
     
-    // Set permissions to 600 (Unix only)
+    // Set permissions to 600 and ownership to Tor user (Unix only)
     set_restrictive_permissions(&secret_path)?;
+    set_tor_ownership(&secret_path)?;
     
     tracing::info!("Wrote hs_ed25519_secret_key to {:?}", secret_path);
     
@@ -433,6 +482,7 @@ pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) 
         .with_context(|| format!("Failed to write public key: {:?}", public_path))?;
     
     set_restrictive_permissions(&public_path)?;
+    set_tor_ownership(&public_path)?;
     
     tracing::info!("Wrote hs_ed25519_public_key to {:?}", public_path);
     
@@ -444,6 +494,7 @@ pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) 
         .with_context(|| format!("Failed to write hostname: {:?}", hostname_path))?;
     
     set_restrictive_permissions(&hostname_path)?;
+    set_tor_ownership(&hostname_path)?;
     
     tracing::info!("Wrote hostname {} to {:?}", onion_addr, hostname_path);
     
