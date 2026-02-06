@@ -1054,7 +1054,7 @@ async fn intro_point_refresh_loop(
         let descriptor_raw = match tor.get_own_hs_descriptor(&addr).await {
             Ok(Some(desc)) => desc,
             Ok(None) => {
-                debug!("No descriptor available yet for {}", addr);
+                info!("No descriptor available yet for {} - waiting for Tor to publish.", addr);
                 continue;
             },
             Err(e) => {
@@ -1079,6 +1079,8 @@ async fn intro_point_refresh_loop(
         };
 
         let new_count = intro_points.len();
+
+        debug!("Intro point refresh loop: new_count = {}", new_count);
 
         // Check if intro points changed
         let (current_count, changed) = {
