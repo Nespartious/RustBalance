@@ -48,7 +48,11 @@ identity_key_path = "/etc/rustbalance/master.key"
 # The target service we reverse proxy to
 # This is the actual application - never shared publicly
 onion_address = "YOUR_TARGET_SERVICE.onion"
+# Port to connect to on the target (80 for HTTP, 443 for HTTPS)
 port = 80
+# Use TLS when connecting to target (set to true for targets that require HTTPS)
+# Example: DuckDuckGo (.onion) requires HTTPS
+use_tls = false
 
 [tor]
 control_host = "127.0.0.1"

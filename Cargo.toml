@@ -45,6 +45,11 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1.5"
 
+# TLS for HTTPS backend proxying
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+webpki-roots = "0.26"  # Mozilla's root certificates
+
 # Time handling
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 

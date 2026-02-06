@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 /// Manages the hidden service lifecycle
@@ -23,6 +24,8 @@ pub struct OnionService {
     target_address: String,
     /// Target port
     target_port: u16,
+    /// Use TLS when connecting to target (HTTPS)
+    use_tls: bool,
     /// Tor SOCKS port for outbound connections
     socks_port: u16,
     /// Master onion address (for response header rewriting)
@@ -55,6 +58,7 @@ impl OnionService {
             local_port: config.local_port,
             target_address: config.target.onion_address.clone(),
             target_port: config.target.port,
+            use_tls: config.target.use_tls,
             socks_port: config.tor.socks_port,
             master_address: config.master.onion_address.clone(),
             join_secret: config.coordination.join_secret.clone(),
@@ -146,8 +150,9 @@ impl OnionService {
 
         info!("Reverse proxy listening on 127.0.0.1:{}", self.local_port);
         info!(
-            "Proxying to {}:{} via SOCKS",
-            self.target_address, self.target_port
+            "Proxying to {}:{} via SOCKS{}",
+            self.target_address, self.target_port,
+            if self.use_tls { " (HTTPS)" } else { "" }
         );
 
         // Build JoinHandler if configured
@@ -168,6 +173,7 @@ impl OnionService {
 
                     let target = self.target_address.clone();
                     let target_port = self.target_port;
+                    let use_tls = self.use_tls;
                     let socks_port = self.socks_port;
                     let master = self.master_address.clone();
                     let handler = Arc::clone(&join_handler);
@@ -177,6 +183,7 @@ impl OnionService {
                             client,
                             &target,
                             target_port,
+                            use_tls,
                             socks_port,
                             &master,
                             handler,
@@ -219,6 +226,7 @@ impl OnionService {
         mut client: TcpStream,
         target: &str,
         target_port: u16,
+        use_tls: bool,
         socks_port: u16,
         master_address: &str,
         join_handler: Arc<Option<JoinHandler>>,
@@ -254,7 +262,7 @@ impl OnionService {
         }
 
         // Not a join request - proxy normally
-        Self::handle_connection(client, target, target_port, socks_port, master_address).await
+        Self::handle_connection(client, target, target_port, use_tls, socks_port, master_address).await
     }
 
     /// Handle a single proxied connection
@@ -262,6 +270,7 @@ impl OnionService {
         client: TcpStream,
         target: &str,
         target_port: u16,
+        use_tls: bool,
         socks_port: u16,
         master_address: &str,
     ) -> Result<()> {
@@ -318,7 +327,101 @@ impl OnionService {
         debug!("SOCKS5 connection established to {}", domain);
 
         // Now proxy with Host header rewriting
-        Self::proxy_with_host_rewrite(client, socks, &domain, target_port, master_address).await
+        // If TLS is enabled, wrap the SOCKS connection with TLS first
+        if use_tls {
+            Self::proxy_with_tls(client, socks, &domain, target_port, master_address).await
+        } else {
+            Self::proxy_with_host_rewrite(client, socks, &domain, target_port, master_address).await
+        }
+    }
+
+    /// Proxy connection over TLS (HTTPS backend)
+    async fn proxy_with_tls(
+        client: TcpStream,
+        socks: TcpStream,
+        target_host: &str,
+        target_port: u16,
+        master_address: &str,
+    ) -> Result<()> {
+        use rustls::RootCertStore;
+        use std::convert::TryFrom;
+
+        // Build TLS config with webpki roots
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(tls_config));
+
+        // Create server name for TLS SNI
+        let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())
+            .context("Invalid server name for TLS")?;
+
+        // Wrap SOCKS connection with TLS
+        let tls_stream = connector
+            .connect(server_name, socks)
+            .await
+            .context("TLS handshake failed")?;
+
+        debug!("TLS handshake completed for {}", target_host);
+
+        // Now proxy with Host header rewriting over TLS connection
+        Self::proxy_with_host_rewrite_tls(client, tls_stream, target_host, target_port, master_address).await
+    }
+
+    /// Proxy connection with TLS backend (separate impl for type safety)
+    async fn proxy_with_host_rewrite_tls(
+        mut client: TcpStream,
+        tls_stream: tokio_rustls::client::TlsStream<TcpStream>,
+        target_host: &str,
+        target_port: u16,
+        master_address: &str,
+    ) -> Result<()> {
+        // For HTTPS, port 443 is implicit, otherwise show it
+        let target_with_port = if target_port == 443 {
+            target_host.to_string()
+        } else {
+            format!("{}:{}", target_host, target_port)
+        };
+
+        let (client_read, mut client_write) = client.split();
+        let (tls_read, tls_write) = tokio::io::split(tls_stream);
+
+        // Wrap in BufReader for line-based reading
+        let mut client_reader = tokio::io::BufReader::new(client_read);
+        let mut tls_reader = tokio::io::BufReader::new(tls_read);
+        let mut tls_writer = tls_write;
+
+        // Spawn task to forward requests client -> server with Host rewriting
+        let target_for_task = target_with_port.clone();
+        let request_forwarder = async move {
+            Self::forward_requests_with_rewrite(&mut client_reader, &mut tls_writer, &target_for_task).await
+        };
+
+        // Spawn task to forward responses server -> client WITH header rewriting
+        let master_for_task = master_address.to_string();
+        let target_for_response = target_host.to_string();
+        let response_forwarder = async move {
+            Self::forward_responses_with_rewrite(&mut tls_reader, &mut client_write, &target_for_response, &master_for_task).await
+        };
+
+        tokio::select! {
+            result = request_forwarder => {
+                if let Err(e) = result {
+                    debug!("Request forwarder error: {}", e);
+                }
+            }
+            result = response_forwarder => {
+                if let Err(e) = result {
+                    debug!("Response forwarder error: {}", e);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Proxy connection with HTTP Host header rewriting

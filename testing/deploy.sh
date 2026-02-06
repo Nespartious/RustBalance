@@ -84,6 +84,7 @@ PEER_PUBKEY=""
 NODE_PRIORITY=10
 CLUSTER_TOKEN=""
 JOIN_SECRET=""
+USE_HTTPS=false
 
 print_usage() {
     echo "Usage:"
@@ -105,6 +106,7 @@ print_usage() {
     echo "  --cluster-token   Cluster authentication token (for --join)"
     echo "  --join-secret     Join secret for Tor Bootstrap Channel (for --join)"
     echo "  --priority        Node priority, lower = higher priority (default: 10)"
+    echo "  --https           Use HTTPS when connecting to target (for targets that require TLS)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -156,6 +158,10 @@ while [[ $# -gt 0 ]]; do
         --join-secret)
             JOIN_SECRET="$2"
             shift 2
+            ;;
+        --https)
+            USE_HTTPS=true
+            shift
             ;;
         --help|-h)
             print_usage
@@ -556,6 +562,13 @@ init_first_node() {
     echo "$JOIN_SECRET_GENERATED" | sudo tee "$CONFIG_DIR/join_secret.txt" > /dev/null
     log "Generated join_secret for Tor Bootstrap Channel"
     
+    # Determine target port based on HTTPS setting
+    if [ "$USE_HTTPS" = true ]; then
+        TARGET_PORT=443
+    else
+        TARGET_PORT=80
+    fi
+    
     # Derive master onion address (run rustbalance to compute it)
     # For now, we'll let rustbalance compute it on first run
     # We need to create a minimal config first
@@ -585,7 +598,8 @@ identity_key_path = "$MASTER_KEY_FILE"
 
 [target]
 onion_address = "$TARGET_ONION"
-port = 80
+port = $TARGET_PORT
+use_tls = $USE_HTTPS
 
 [tor]
 control_host = "127.0.0.1"
@@ -662,6 +676,12 @@ EOF
     echo ""
     echo "Run this command on each additional node to join the cluster:"
     echo ""
+    # Build HTTPS flag string if needed
+    local HTTPS_FLAG=""
+    if [ "$USE_HTTPS" = true ]; then
+        HTTPS_FLAG=" \\\\
+  --https"
+    fi
     if [ "$MASTER_ONION" != "PENDING_FIRST_RUN" ]; then
         echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \\"
         echo "  --join \\"
@@ -671,7 +691,14 @@ EOF
         echo "  --peer-endpoint \"$ENDPOINT\" \\"
         echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
         echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-        echo "  --join-secret \"$JOIN_SECRET_GENERATED\"${NC}"
+        echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
+        if [ "$USE_HTTPS" = true ]; then
+            echo " \\"
+            echo "  --https"
+        else
+            echo ""
+        fi
+        echo -e "${NC}"
     else
         echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \\"
         echo "  --join \\"
@@ -681,7 +708,14 @@ EOF
         echo "  --peer-endpoint \"$ENDPOINT\" \\"
         echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
         echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-        echo "  --join-secret \"$JOIN_SECRET_GENERATED\"${NC}"
+        echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
+        if [ "$USE_HTTPS" = true ]; then
+            echo " \\"
+            echo "  --https"
+        else
+            echo ""
+        fi
+        echo -e "${NC}"
     fi
     echo ""
     echo "Or if you already have the binary, run:"
@@ -693,7 +727,14 @@ EOF
     echo "  --peer-endpoint \"$ENDPOINT\" \\"
     echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
     echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-    echo "  --join-secret \"$JOIN_SECRET_GENERATED\"${NC}"
+    echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
+    if [ "$USE_HTTPS" = true ]; then
+        echo " \\"
+        echo "  --https"
+    else
+        echo ""
+    fi
+    echo -e "${NC}"
     echo ""
     echo -e "${YELLOW}IMPORTANT: The service will auto-start after deployment.${NC}"
     echo "The script will wait for the hidden service to become reachable."
@@ -806,6 +847,13 @@ join_cluster() {
     OUR_ENDPOINT="${OUR_IP}:51820"
     log "Our external endpoint for gossip: $OUR_ENDPOINT"
     
+    # Determine target port based on HTTPS setting
+    if [ "$USE_HTTPS" = true ]; then
+        TARGET_PORT=443
+    else
+        TARGET_PORT=80
+    fi
+    
     # Create config file
     log "Creating configuration file..."
     sudo tee "$CONFIG_DIR/config.toml" > /dev/null << EOF
@@ -831,7 +879,8 @@ identity_key_path = "$MASTER_KEY_FILE"
 
 [target]
 onion_address = "$TARGET_ONION"
-port = 80
+port = $TARGET_PORT
+use_tls = $USE_HTTPS
 
 [tor]
 control_host = "127.0.0.1"

@@ -230,9 +230,13 @@ pub struct WireguardPeer {
 pub struct TargetConfig {
     /// Target .onion address (the real service)
     pub onion_address: String,
-    /// Target port (usually 80)
+    /// Target port (usually 80 for HTTP, 443 for HTTPS)
     #[serde(default = "default_target_port")]
     pub port: u16,
+    /// Use TLS/HTTPS when connecting to target (default: false)
+    /// Set to true for targets that require HTTPS (e.g., DuckDuckGo)
+    #[serde(default)]
+    pub use_tls: bool,
 }
 
 fn default_target_port() -> u16 {
