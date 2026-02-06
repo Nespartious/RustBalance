@@ -50,6 +50,9 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 webpki-roots = "0.26"  # Mozilla's root certificates
 
+# Compression for body rewriting
+flate2 = "1.0"  # gzip/deflate compression
+
 # Time handling
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 

@@ -16,6 +16,63 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+/// Custom certificate verifier for .onion targets that skips verification
+///
+/// This is safe because:
+/// 1. Tor provides end-to-end encryption already
+/// 2. The .onion address itself is cryptographic authentication (derived from public key)
+/// 3. Most .onion sites use self-signed certificates that won't validate
+#[derive(Debug)]
+struct OnionCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for OnionCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Accept any certificate for .onion targets
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // Support all common signature schemes
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
 /// Manages the hidden service lifecycle
 pub struct OnionService {
     /// Local port we listen on for HS connections
@@ -343,21 +400,37 @@ impl OnionService {
         target_port: u16,
         master_address: &str,
     ) -> Result<()> {
-        use rustls::RootCertStore;
         use std::convert::TryFrom;
 
-        // Build TLS config with webpki roots and ring crypto provider
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        // Use ring as the crypto provider (required for rustls 0.23+)
-        let tls_config = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into()
-        )
-            .with_safe_default_protocol_versions()
-            .context("Failed to set TLS protocol versions")?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        // For .onion targets, skip certificate verification since:
+        // 1. Tor provides end-to-end encryption already
+        // 2. The .onion address is cryptographic authentication
+        // 3. Most .onion sites use self-signed certificates
+        let is_onion = target_host.ends_with(".onion");
+        
+        let tls_config = if is_onion {
+            // Use a permissive verifier for .onion targets
+            rustls::ClientConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into()
+            )
+                .with_safe_default_protocol_versions()
+                .context("Failed to set TLS protocol versions")?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(OnionCertVerifier))
+                .with_no_client_auth()
+        } else {
+            // Use standard webpki roots for clearnet targets
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            
+            rustls::ClientConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into()
+            )
+                .with_safe_default_protocol_versions()
+                .context("Failed to set TLS protocol versions")?
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
 
         let connector = TlsConnector::from(Arc::new(tls_config));
 
@@ -371,7 +444,8 @@ impl OnionService {
             .await
             .context("TLS handshake failed")?;
 
-        debug!("TLS handshake completed for {}", target_host);
+        debug!("TLS handshake completed for {} (onion={}, cert verification skipped={})", 
+               target_host, is_onion, is_onion);
 
         // Now proxy with Host header rewriting over TLS connection
         Self::proxy_with_host_rewrite_tls(client, tls_stream, target_host, target_port, master_address).await
