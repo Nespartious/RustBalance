@@ -251,7 +251,7 @@ pub async fn run(
     let publish_handle =
         tokio::spawn(async move { publish_loop(state_clone, coord_clone, config_clone).await });
 
-    // Intro point refresh loop - periodically fetches our intro points from Tor
+    // Intro point refresh loop - periodically fetches and parses our own descriptor
     let state_clone = Arc::clone(&state);
     let coord_clone = Arc::clone(&coordinator);
     let config_clone = config.clone();
@@ -367,6 +367,8 @@ async fn heartbeat_loop(
         let coord = coordinator.read().await;
         if let Err(e) = coord.broadcast(&msg).await {
             warn!("Failed to send heartbeat: {}", e);
+        } else {
+            debug!("Successfully sent heartbeat to peers");
         }
 
         // Also broadcast our intro points with every heartbeat
