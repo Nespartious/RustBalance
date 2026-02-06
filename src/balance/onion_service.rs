@@ -642,6 +642,14 @@ impl OnionService {
                     }
                     writer.write_all(new_header.as_bytes()).await?;
                 }
+                // Rewrite Content-Security-Policy header
+                else if lower.starts_with("content-security-policy:") {
+                    let new_header = Self::rewrite_csp(&header_line, target_host, master_address);
+                    if new_header != header_line {
+                        debug!("Rewrote Content-Security-Policy header");
+                    }
+                    writer.write_all(new_header.as_bytes()).await?;
+                }
                 // Track Content-Length
                 else if lower.starts_with("content-length:") {
                     if let Some(len_str) = header_line.split(':').nth(1) {
@@ -824,6 +832,49 @@ impl OnionService {
         }
         
         format!("Set-Cookie:{}\r\n", new_parts.join(";").trim_end())
+    }
+
+    /// Rewrite Content-Security-Policy header to replace target address with master address
+    ///
+    /// This allows resources to load from the master address instead of being blocked
+    /// because CSP only allows the original target address.
+    fn rewrite_csp(header: &str, target_host: &str, master_address: &str) -> String {
+        // Extract the CSP value from "Content-Security-Policy: ..."
+        let parts: Vec<&str> = header.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return header.to_string();
+        }
+        
+        let header_name = parts[0];
+        let csp_value = parts[1];
+        
+        // Target variations to replace
+        let target_base = target_host.trim_end_matches(".onion");
+        let master_base = master_address.trim_end_matches(".onion");
+        
+        // Replace all occurrences of target with master
+        // Handle both http:// and https:// URLs
+        let mut result = csp_value.to_string();
+        
+        // Replace https://target.onion with https://master.onion
+        result = result.replace(
+            &format!("https://{}.onion", target_base),
+            &format!("https://{}.onion", master_base)
+        );
+        
+        // Replace http://target.onion with http://master.onion
+        result = result.replace(
+            &format!("http://{}.onion", target_base),
+            &format!("http://{}.onion", master_base)
+        );
+        
+        // Replace bare target.onion references
+        result = result.replace(
+            &format!("{}.onion", target_base),
+            &format!("{}.onion", master_base)
+        );
+        
+        format!("{}:{}\r\n", header_name, result.trim_end())
     }
 }
 
