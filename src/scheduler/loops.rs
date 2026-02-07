@@ -187,6 +187,26 @@ pub async fn run(
             .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
+        // CRITICAL: Disable Tor auto-publish IMMEDIATELY for joining nodes.
+        // Joining nodes are always in multi-node mode (they have configured peers).
+        // Without this, Tor starts auto-publishing a descriptor with only this
+        // node's intro points the moment the HS is configured, overwriting the
+        // existing merged descriptor on HSDirs before the publish_loop can act.
+        // This is the primary fix for the "boot race" session skew bug.
+        info!("Joining node: disabling Tor auto-publish immediately after HS config");
+        match crate::tor::control::TorController::connect(&config.tor).await {
+            Ok(mut tor) => {
+                if let Err(e) = tor.set_publish_descriptors(false).await {
+                    warn!("Failed to disable Tor auto-publish for joining node: {}", e);
+                } else {
+                    info!("Tor auto-publish disabled for joining node — only HSPOST will be used");
+                }
+            },
+            Err(e) => {
+                warn!("Failed to connect to Tor for auto-publish disable: {}", e);
+            },
+        }
+
         // Wait for Tor to create intro points
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -606,6 +626,38 @@ async fn publish_loop(
     let identity = crate::crypto::load_identity_key(&config.master.identity_key_path)?;
     let mut publisher = Publisher::new(identity);
 
+    // Track whether Tor's auto-publish is disabled (for multi-node mode)
+    let mut auto_publish_disabled = false;
+
+    // CRITICAL: Check for multi-node mode and disable auto-publish BEFORE the
+    // 90-second intro point wait. For joining nodes (which already have peers at
+    // startup), this is a safety net in case the early disable in run() failed.
+    // For init nodes that somehow have peers already, this catches them too.
+    {
+        let coord = coordinator.read().await;
+        let alive = coord.peers().alive_count();
+        if alive > 0 {
+            info!(
+                "Publish loop startup: {} active peer(s) detected, disabling Tor auto-publish immediately",
+                alive
+            );
+            drop(coord); // Release lock before connecting to Tor
+            match crate::tor::control::TorController::connect(&config.tor).await {
+                Ok(mut tor) => {
+                    if let Err(e) = tor.set_publish_descriptors(false).await {
+                        warn!("Failed to disable Tor auto-publish at startup: {}", e);
+                    } else {
+                        auto_publish_disabled = true;
+                        info!("Tor auto-publish disabled at publish loop startup");
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to connect to Tor at startup: {}", e);
+                },
+            }
+        }
+    }
+
     // Wait for hidden service to be established AND intro points to be collected
     // The intro_check loop waits 60 seconds then checks every 30 seconds,
     // so we wait 90 seconds to ensure at least one intro point check has completed.
@@ -623,9 +675,6 @@ async fn publish_loop(
 
     // Max intro points per descriptor (from config, Tor spec max is 20)
     let max_intro_points = config.publish.max_intro_points;
-
-    // Track whether Tor's auto-publish is disabled (for multi-node mode)
-    let mut auto_publish_disabled = false;
 
     loop {
         // Auto-detect mode: check if we have active peers
