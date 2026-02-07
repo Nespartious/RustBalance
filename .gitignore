@@ -27,3 +27,6 @@ master_ed25519*
 # Testing session files (contain SSH credentials)
 testing/session.env
 testing/*.log
+
+# Compiled binaries in testing
+testing/rustbalance_bin
