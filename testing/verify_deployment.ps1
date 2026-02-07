@@ -46,21 +46,30 @@ function Write-Check {
     Write-Host "$Value" -ForegroundColor $color
 }
 
+function Get-Section {
+    param([string]$Text, [string]$Start, [string]$End)
+    $pattern = "(?s)===${Start}===\s*(\r?\n)+(.*?)(\r?\n)===${End}==="
+    if ($Text -match $pattern) {
+        return ($Matches[2]).Trim()
+    }
+    return ""
+}
+
 function Get-VMHealth {
     param([string]$VMHost, [string]$VMName)
 
     Write-Host ""
-    Write-Host "  ── $VMName ($VMHost) ──" -ForegroundColor $C_HEAD
+    Write-Host "  -- $VMName ($VMHost) --" -ForegroundColor $C_HEAD
     Write-Host ""
 
-    # Single SSH call — run all checks in one shot, parse the output
+    # Single SSH call - run all checks in one shot, parse the output
     $checkScript = @"
 echo $sudoPass | sudo -S bash -c '
 echo "===SERVICE_STATUS==="
 systemctl is-active rustbalance 2>/dev/null || echo "inactive"
 
 echo "===UPTIME==="
-ps -eo pid,etime,comm 2>/dev/null | grep rustbalance | awk "{print \$2}" | head -1 || echo "not-running"
+ps -eo etime,comm 2>/dev/null | grep rustbalance | head -1 | sed "s/rustbalance//" | xargs || echo "not-running"
 
 echo "===WG_PEERS==="
 wg show wg-rb 2>/dev/null | grep -c "peer:" || echo "0"
@@ -84,7 +93,7 @@ echo "===PUBLISH_STATUS==="
 journalctl -u rustbalance --no-pager 2>/dev/null | grep -iE "HSPOST.*accepted|published.*descriptor|Successfully published" | tail -3
 
 echo "===ELECTION==="
-journalctl -u rustbalance --no-pager 2>/dev/null | grep -iE "Publisher is now|became publisher|election" | tail -3
+journalctl -u rustbalance --no-pager 2>/dev/null | grep -iE "Publisher is now|became publisher|election|Taking over" | tail -3
 
 echo "===INTRO_POINTS==="
 journalctl -u rustbalance --no-pager 2>/dev/null | grep -iE "introduction points|intro.*point" | tail -3
@@ -100,20 +109,11 @@ echo "===END==="
     $raw = ssh -i $sshKey $VMHost "echo $enc | base64 -d | bash" 2>&1
 
     if ($LASTEXITCODE -ne 0 -and -not $raw) {
-        Write-Check "SSH Connection" "FAILED — cannot reach $VMHost" "fail"
+        Write-Check "SSH Connection" "FAILED - cannot reach $VMHost" "fail"
         return
     }
 
-    $output = $raw -join "`n"
-
-    # Parse sections
-    function Get-Section {
-        param([string]$Text, [string]$Start, [string]$End)
-        if ($Text -match "(?s)===${Start}===\s*\n(.*?)\n===${End}===") {
-            return ($Matches[1]).Trim()
-        }
-        return ""
-    }
+    $output = ($raw | Out-String)
 
     $serviceStatus = Get-Section $output "SERVICE_STATUS" "UPTIME"
     $uptime        = Get-Section $output "UPTIME" "WG_PEERS"
@@ -166,7 +166,6 @@ echo "===END==="
 
     # 5. WG handshake recency
     if ($wgHandshakes -and $wgHandshakes -ne "none") {
-        # Parse the latest handshake timestamp (seconds since last handshake)
         $handshakeLines = $wgHandshakes -split "`n" | Where-Object { $_ -match '\d+' }
         $stale = $false
         foreach ($line in $handshakeLines) {
@@ -232,7 +231,7 @@ echo "===END==="
             Write-Check "Descriptor publishing" "see logs" "warn"
         }
     } else {
-        # Not all nodes publish — only the elected publisher
+        # Not all nodes publish - only the elected publisher
         if ($election -match "Publisher is now.*$VMName") {
             Write-Check "Descriptor publishing" "elected but no publish found" "warn"
         }
@@ -243,6 +242,8 @@ echo "===END==="
         $lastElection = ($election -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1).Trim()
         if ($lastElection -match "Publisher is now: (\S+)") {
             Write-Check "Election" "Publisher: $($Matches[1])" "pass"
+        } elseif ($lastElection -match "Taking over as publisher") {
+            Write-Check "Election" "This node is publisher" "pass"
         } else {
             Write-Check "Election" "$lastElection" "pass"
         }
@@ -251,7 +252,7 @@ echo "===END==="
     # Detailed output
     if ($Detailed) {
         Write-Host ""
-        Write-Host "  ── Detailed Logs ──" -ForegroundColor $C_DIM
+        Write-Host "  -- Detailed Logs --" -ForegroundColor $C_DIM
 
         if ($introPoints) {
             Write-Host "  Intro points:" -ForegroundColor $C_DIM
@@ -276,7 +277,7 @@ echo "===END==="
     }
 }
 
-# ── Main ──
+# -- Main --
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor $C_HEAD
@@ -293,7 +294,7 @@ if (-not $VM1Only) {
     Get-VMHealth -VMHost $vm2 -VMName "VM2-hlsn2"
 }
 
-# ── Summary ──
+# -- Summary --
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor $C_HEAD
