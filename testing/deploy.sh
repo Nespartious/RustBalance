@@ -382,6 +382,13 @@ build_rustbalance() {
     source "$HOME/.cargo/env"
     cargo build --release
     
+    # Stop running service before replacing binary (prevents "Text file busy")
+    if systemctl is-active --quiet rustbalance 2>/dev/null; then
+        log "Stopping running rustbalance service before binary replacement..."
+        sudo systemctl stop rustbalance
+        sleep 1
+    fi
+    
     # Copy binary to system path
     sudo cp "$INSTALL_DIR/target/release/rustbalance" /usr/local/bin/
     sudo chmod +x /usr/local/bin/rustbalance
