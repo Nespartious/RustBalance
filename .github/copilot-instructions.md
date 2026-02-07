@@ -16,6 +16,45 @@ A pre-commit hook is installed to enforce this, but always verify before committ
 
 ---
 
+## ⚠️ CRITICAL: Branch & Workflow Rules
+
+### Branch Strategy
+
+| Branch | Purpose | Protected | Merge Via |
+|--------|---------|-----------|-----------|
+| `main` | **Stable, deployable** — last known working version. Never commit directly. | ✅ | PR from `dev` only |
+| `dev` | **Active development** — all Phase work happens here. Must pass CI before merging to main. | ✅ | PR from feature branches or direct commits |
+| `feature/*` | **Optional** — for large multi-commit tasks, branch from `dev`, PR back to `dev`. | ❌ | PR to `dev` |
+
+### Workflow Rules
+
+1. **NEVER commit directly to `main`** — All changes reach main through a PR from `dev`.
+2. **All work happens on `dev`** — Small tasks can be committed directly to `dev`. Larger tasks (multi-file, risky) should use a `feature/*` branch with a PR to `dev`.
+3. **CI must pass before merge** — Every PR to `dev` or `main` must pass: `cargo check`, `cargo clippy`, `cargo test`, `cargo fmt --check`.
+4. **Test before declaring done** — Each task in a Phase document must be tested (compile + runtime behavior) before marking complete.
+5. **Atomic commits** — One logical change per commit. Don't mix refactors with features. Use conventional commit prefixes: `fix:`, `feat:`, `refactor:`, `docs:`, `chore:`, `test:`.
+6. **PR to main = release** — When `dev` is stable and tested (all Phase tasks for the sprint are complete), open a PR to `main`. This is a release checkpoint.
+
+### Deployment Branch
+
+- **Testing deployments** use `dev` branch:
+  ```bash
+  curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/dev/testing/deploy.sh | sudo bash -s -- [args]
+  ```
+- **Production deployments** use `main` branch (the default URL).
+- **Never deploy from a feature branch** unless explicitly testing that branch.
+
+### PR Checklist (enforce on every PR)
+
+- [ ] `cargo check` passes
+- [ ] `cargo clippy -- -D warnings` passes (zero warnings)
+- [ ] `cargo test` passes
+- [ ] `cargo fmt --check` passes
+- [ ] Commit messages use conventional format
+- [ ] Related Phase document task is referenced in PR description
+
+---
+
 ## Terminology
 
 | Term | Meaning |
@@ -212,17 +251,20 @@ We have 2 headless Ubuntu Server VMs for testing:
 **NEVER copy files directly to VMs.** All deployments MUST use the GitHub download method:
 
 ```bash
-# Correct: Download deploy script from GitHub and run
+# Testing: Deploy from dev branch
+curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/dev/testing/deploy.sh | sudo bash -s -- [args]
+
+# Production: Deploy from main branch
 curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- [args]
 
-# Or clone the repo
-git clone https://github.com/Nespartious/RustBalance.git
+# Or clone a specific branch
+git clone -b dev https://github.com/Nespartious/RustBalance.git
 ```
 
 **Why this matters:**
 1. **Consistency**: All nodes run identical, version-controlled code
 2. **Auditability**: Deployments are traceable to specific commits
-3. **Branch support**: Can deploy from feature branches for testing
+3. **Branch support**: `dev` for testing, `main` for stable releases
 4. **No drift**: Prevents local modifications from polluting deployments
 
 **The deploy script itself clones from GitHub** - it never uses locally copied files.
@@ -231,7 +273,7 @@ git clone https://github.com/Nespartious/RustBalance.git
 
 **First node (--init mode):**
 ```bash
-curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \
+curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/dev/testing/deploy.sh | sudo bash -s -- \
   --init \
   --target <target.onion> \
   --endpoint <this_node_ip>:51820
@@ -239,7 +281,7 @@ curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing
 
 **Additional nodes (--join mode):**
 ```bash
-curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \
+curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/dev/testing/deploy.sh | sudo bash -s -- \
   --join \
   --target <target.onion> \
   --master-onion <master.onion> \

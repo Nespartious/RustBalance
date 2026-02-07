@@ -1,9 +1,9 @@
 name: Quick Check
 
-# Runs on PRs and manual trigger
+# Runs on PRs to dev and main
 on:
   pull_request:
-    branches: [main]
+    branches: [dev, main]
   workflow_dispatch:
 
 env:
