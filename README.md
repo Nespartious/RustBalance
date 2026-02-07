@@ -1,354 +1,198 @@
 # RustBalance
 
-**High-availability reverse proxy for Tor hidden services with automatic failover and mesh self-healing.**
+**Tor hidden service load balancer — multi-node, self-healing, zero single point of failure.**
 
-> ⚠️ **Security Notice**: This project is for Tor/Onion network infrastructure. No JavaScript, XML, or browser-executable content.
+RustBalance distributes Tor `.onion` traffic across multiple VMs using a shared master address. Each node is a full hidden service that reverse-proxies to your real application. Nodes coordinate over WireGuard, elect a publisher, and merge their introduction points into one descriptor. If a node dies, traffic shifts to survivors automatically.
 
----
-
-## TL;DR
-
-RustBalance lets you run **multiple VMs as a single .onion address** with automatic load distribution and failover:
-
-1. Deploy RustBalance on 2+ VMs
-2. All nodes share the same master .onion address  
-3. Clients connect to any node randomly (Tor handles distribution)
-4. If a node dies, traffic automatically goes to surviving nodes
-5. Nodes discover each other via gossip - no manual mesh management
-
-**Quick Deploy:**
-```bash
-# First node (generates master key + cluster token)
-curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \
-  --init --target your-real-service.onion --endpoint YOUR_IP:51820
-
-# Additional nodes (use values from first node output)
-curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \
-  --join --target your-real-service.onion --master-onion MASTER.onion \
-  --master-key "BASE64_KEY" --peer-endpoint FIRST_NODE_IP:51820 \
-  --peer-pubkey "WG_PUBKEY" --cluster-token "TOKEN"
-```
+> Built in Rust. Inspired by [Onionbalance](https://onionservices.torproject.org/apps/base/onionbalance/). Designed to go further.
 
 ---
 
 ## How It Works
 
-### Architecture
+### 1 Node
 
 ```
-                    ┌─────────────────────┐
-                    │       Client        │
-                    │ visits master.onion │
-                    └──────────┬──────────┘
-                               │
-                    Tor HS protocol (random intro point selection)
-                               │
-         ┌─────────────────────┼─────────────────────┐
-         ▼                     ▼                     ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ RustBalance     │  │ RustBalance     │  │ RustBalance     │
-│ Node A (VM1)    │  │ Node B (VM2)    │  │ Node C (VM3)    │
-│                 │  │                 │  │                 │
-│ - IS a Tor HS   │  │ - IS a Tor HS   │  │ - IS a Tor HS   │
-│ - Own intro pts │  │ - Own intro pts │  │ - Own intro pts │
-│ - Accepts conns │  │ - Accepts conns │  │ - Accepts conns │
-│ - Reverse proxy │  │ - Reverse proxy │  │ - Reverse proxy │
-└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-         │                    │                    │
-         │   WireGuard mesh (auto-healing gossip)  │
-         └────────────────────┼────────────────────┘
-                              │
-                    Reverse proxy over Tor SOCKS
-                              │
-                              ▼
-                    ┌─────────────────────┐
-                    │   Target Service    │
-                    │  (real app .onion)  │
-                    │                     │
-                    │   Never publicly    │
-                    │      exposed        │
-                    └─────────────────────┘
+    Client
+      │
+      ▼
+┌────────────┐       ┌────────────┐
+│ RustBalance│──────▶│  Target    │
+│  Node A    │ proxy │  .onion    │
+│ (master)   │       │ (your app) │
+└────────────┘       └────────────┘
+
+• Node IS the master .onion address
+• Tor handles descriptor publishing natively
+• Ready to scale — add nodes any time
 ```
 
-### Key Concepts
-
-| Concept | Description |
-|---------|-------------|
-| **Master Address** | The public `.onion` clients connect to - shared by all nodes |
-| **Target Service** | Your real application's .onion - never publicly exposed |
-| **Introduction Points** | Tor relays that accept connections on behalf of the service |
-| **Descriptor** | Signed document listing intro points, published to HSDir ring |
-| **Gossip Protocol** | How nodes discover each other and self-heal the mesh |
-
-### What Makes It Different
-
-| Feature | Traditional LB | Standard Onionbalance | RustBalance |
-|---------|---------------|----------------------|-------------|
-| Architecture | Centralized | Fetch descriptors | Reverse proxy |
-| Single point of failure | Yes | Partially | No |
-| Node coordination | N/A | None | WireGuard mesh |
-| Failover | Manual | Slow (descriptor refresh) | Automatic |
-| Mesh topology | N/A | N/A | Self-healing |
-
----
-
-## Detailed Operation
-
-### Single-Node vs Multi-Node (Auto-Detect)
-
-RustBalance automatically determines its operating mode:
-
-**Single-Node Mode** (no peers detected):
-- Tor handles descriptor publishing natively
-- Node runs as standard hidden service
-- Ready to scale up at any time
-
-**Multi-Node Mode** (peers detected via heartbeat):
-- Election determines publisher node
-- Publisher merges intro points from all nodes
-- Merged descriptor published via HSPOST
-- If publisher dies, next priority node takes over
-
-### Gossip-Based Mesh Self-Healing
-
-**Problem:** Node C joins via Node B. Node A and C don't know each other.
+### 2 Nodes
 
 ```
-Node A ←──WG──→ Node B ←──WG──→ Node C
-   ↑                              ↑
-   └──────── NO CONNECTION ───────┘
+         Client
+           │
+     (random intro point)
+       ┌───┴───┐
+       ▼       ▼
+┌──────────┐ ┌──────────┐
+│  Node A  │ │  Node B  │
+│ priority │ │ priority │
+│   = 10   │ │   = 20   │
+└────┬─────┘ └─────┬────┘
+     │  WireGuard  │          ┌────────────┐
+     │◄───────────►│──proxy──▶│   Target   │
+     │  heartbeat  │          │   .onion   │
+     └──────┬──────┘          └────────────┘
+            │
+    Node A publishes merged
+    descriptor (6 intro pts)
+    3 from A + 3 from B
 ```
 
-**Solution:** Each heartbeat includes `known_peers` list:
-
-1. Node B sends heartbeat to Node A with `known_peers: [Node C]`
-2. Node A discovers Node C, adds WireGuard peer dynamically
-3. Node A sends PeerAnnounce to Node C
-4. Full mesh established automatically
+### 5 Nodes
 
 ```
-A ─── B
- \   /
-  \ /
-   C
+                       Client
+                         │
+                  (random intro point)
+       ┌────────┬───────┼───────┬────────┐
+       ▼        ▼       ▼       ▼        ▼
+   ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+   │  A   │ │  B   │ │  C   │ │  D   │ │  E   │
+   │ p=10 │ │ p=20 │ │ p=30 │ │ p=40 │ │ p=50 │
+   └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘
+      │        │        │        │        │
+      └────────┴────────┴────────┴────────┘
+            WireGuard full-mesh (gossip)
+                        │
+             Node A publishes merged
+             descriptor (15 intro pts)
+                        │
+                        ▼
+                 ┌────────────┐
+                 │   Target   │
+                 │   .onion   │
+                 └────────────┘
 
-Full mesh (self-healed)
-```
-
-### Publisher Election
-
-Lease-based election - no consensus required:
-
-1. All nodes start as `Standby`
-2. Nodes exchange heartbeats via WireGuard (every 10s)
-3. If publisher heartbeat missing for `heartbeat_timeout` (30s):
-   - Mark publisher as "suspect"
-   - Start grace period timer (90s)
-4. After grace expires:
-   - Lowest priority number wins
-   - Winner claims lease, becomes publisher
-   - Others back off
-
-**No voting. No quorum. No split-brain.**
-
-### Takeover Timeline Example
-
-```
-T=0s     Node A (priority=10) is publisher, sends heartbeat
-T=10s    Node B (priority=20) sees healthy heartbeat, stays standby
-T=25s    Node A crashes
-T=55s    Node B notices missing heartbeats, marks suspect
-T=145s   Grace period (90s) expired
-T=146s   Node B claims lease, becomes publisher
-T=150s   Node B publishes new merged descriptor
+• All nodes reverse-proxy to same target
+• Gossip protocol auto-discovers full mesh
+• If Node A dies → Node B takes over publishing
+• 15 intro points = 5× redundancy
 ```
 
 ---
 
-## Configuration
+## Quick Deploy
 
-### Minimal Example
+```bash
+# Node 1 — generates master key + cluster token
+curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | \
+  sudo bash -s -- --init --target your-real-service.onion --endpoint YOUR_IP:51820
 
-```toml
-[node]
-id = "node-a"
-priority = 10
-
-[master]
-onion_address = "yourmasteraddress.onion"
-identity_key_path = "/etc/rustbalance/master_ed25519.key"
-
-[target]
-onion_address = "your-real-service.onion"
-port = 80
-
-[coordination]
-cluster_token = "shared-secret-from-first-node"
-
-[wireguard]
-interface = "wg-rb"
-listen_port = 51820
-tunnel_ip = "10.200.200.1"
-private_key = "BASE64_PRIVATE_KEY"
-public_key = "BASE64_PUBLIC_KEY"
-external_endpoint = "YOUR_PUBLIC_IP:51820"
-```
-
-See [docs/CONFIG.md](docs/CONFIG.md) for complete reference.
-
----
-
-## Module Structure
-
-```
-src/
-├── main.rs           # Entry point, arg parsing
-├── lib.rs            # Library exports
-├── logging.rs        # Structured logging
-│
-├── config/           # Configuration loading
-│   ├── mod.rs        # Config structs
-│   ├── file.rs       # TOML loading
-│   └── validation.rs # Validation rules
-│
-├── crypto/           # Cryptographic operations
-│   ├── mod.rs        # Module exports
-│   ├── keys.rs       # Ed25519 key handling
-│   └── blinding.rs   # v3 key blinding
-│
-├── tor/              # Tor daemon interaction
-│   ├── mod.rs        # Module exports
-│   ├── control.rs    # ControlPort client
-│   ├── descriptors.rs # Descriptor parsing
-│   └── hsdir.rs      # HSDir ring calculation
-│
-├── balance/          # Load balancing logic
-│   ├── mod.rs        # Module exports
-│   ├── backend.rs    # Backend tracking
-│   ├── health.rs     # Health checking
-│   ├── merge.rs      # Descriptor merging
-│   └── publish.rs    # HSPOST publishing
-│
-├── coord/            # Node coordination
-│   ├── mod.rs        # Coordinator struct
-│   ├── messages.rs   # Protocol messages
-│   ├── peers.rs      # Peer state tracking
-│   ├── wireguard.rs  # WireGuard transport
-│   ├── election.rs   # Publisher election
-│   └── lease.rs      # Lease management
-│
-├── repair/           # Self-healing
-│   ├── mod.rs        # Repair manager
-│   ├── actions.rs    # Repair actions
-│   └── restart.rs    # Tor restart logic
-│
-├── scheduler/        # Task orchestration
-│   ├── mod.rs        # Scheduler exports
-│   └── loops.rs      # Main event loops
-│
-├── state/            # Runtime state
-│   ├── mod.rs        # State manager
-│   └── model.rs      # State structures
-│
-└── util/             # Utilities
-    ├── mod.rs        # Utility exports
-    ├── time.rs       # Time helpers
-    └── rand.rs       # Randomization
+# Node 2+ — use values from Node 1 output
+curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | \
+  sudo bash -s -- --join --target your-real-service.onion --master-onion MASTER.onion \
+  --master-key "BASE64_KEY" --peer-endpoint NODE1_IP:51820 --peer-pubkey "WG_PUBKEY" --cluster-token "TOKEN"
 ```
 
 ---
 
-## Security Model
+## Feature Status
 
-### Key Isolation
-- Master identity key lives **only** on RustBalance nodes
-- Target service key is separate and independent
-- Compromised target doesn't expose master key
+### vs Onionbalance
 
-### Cluster Security
-- **Cluster Token**: Shared secret authenticates new nodes joining mesh
-- **WireGuard**: Encrypts and authenticates all inter-node traffic
-- **Clock Validation**: Messages rejected if timestamp skew > 5s
+Onionbalance is the standard Tor load balancer maintained by the Tor Project. RustBalance takes a different architectural approach — each node IS a hidden service (reverse-proxy model) rather than a separate publisher fetching descriptors from backend instances.
 
-### Attack Surface
+| Capability | Onionbalance | RustBalance | Status |
+|:-----------|:------------:|:-----------:|:------:|
+| Descriptor merging from multiple nodes | ✅ | ✅ | 🟢 |
+| v3 onion service support | ✅ | ✅ | 🟢 |
+| Introduction point aggregation | ✅ | ✅ | 🟢 |
+| HSPOST descriptor publishing | ✅ | ✅ | 🟢 |
+| Master key isolation | ✅ | ✅ | 🟢 |
+| Multi-node coordination | ❌ | ✅ | 🟢 |
+| WireGuard encrypted mesh | ❌ | ✅ | 🟢 |
+| Gossip-based peer discovery | ❌ | ✅ | 🟢 |
+| Self-healing mesh topology | ❌ | ✅ | 🟢 |
+| Automatic publisher failover | ❌ | ✅ | 🟢 |
+| Lease-based election (no consensus) | ❌ | ✅ | 🟢 |
+| Integrated reverse proxy | ❌ | ✅ | 🟢 |
+| One-command deploy script | ❌ | ✅ | 🟢 |
+| Tor bootstrap join (no pre-shared WG) | ❌ | ✅ | 🟢 |
+| Auto-detect single/multi-node mode | ❌ | ✅ | 🟢 |
+| No single point of failure | ❌ | ✅ | 🟢 |
+| Proof-of-Work support | ❌ | ✅ | 🟢 |
+| Target health checking (HTTP probe) | ❌ | ❌ | 🔴 |
+| Descriptor reupload on failure | ❌ | ❌ | 🔴 |
+| Restricted discovery / client auth | ❌ | ❌ | 🔴 |
 
-| Threat | Impact | Mitigation |
-|--------|--------|------------|
-| Node compromise | Attacker can see traffic through that node | Other nodes continue operating |
-| Target compromise | Service disruption | Master address unaffected, redeploy target |
-| WireGuard key leak | Attacker could join mesh | Cluster token provides second factor |
-| Network partition | Nodes can't coordinate | Each node continues serving independently |
+> 🟢 Implemented &nbsp; 🟡 In progress &nbsp; 🔴 Not yet implemented
+
+### Improvements Over Onionbalance
+
+These are features RustBalance adds that Onionbalance doesn't have:
+
+- 🟢 **No single point of failure** — any node can become publisher
+- 🟢 **Encrypted node coordination** — WireGuard mesh, not clearnet
+- 🟢 **Gossip discovery** — nodes find each other automatically
+- 🟢 **Self-healing mesh** — chain topology → full mesh, no manual wiring
+- 🟢 **Automatic failover** — publisher election with grace period, no human intervention
+- 🟢 **Integrated reverse proxy** — no separate backend onion services needed
+- 🟢 **One-command deploy** — `curl | bash` to production in minutes
+- 🟢 **Tor Bootstrap Channel** — joining nodes connect via master `.onion`, no pre-shared WireGuard info
+- 🟢 **PoW support** — uses file-based `HiddenServiceDir` (Onionbalance uses `ADD_ONION` which can't do PoW)
+
+### Roadmap — What's Left
+
+| Feature | Phase | Difficulty |
+|:--------|:-----:|:----------:|
+| 🔴 Tor process watchdog | 1 | Easy |
+| 🔴 Connection timeout to target | 1 | Easy |
+| 🔴 Publish retry with backoff | 1 | Easy |
+| 🔴 Smart first-publish timing | 1 | Easy |
+| 🔴 Systemd hardening | 1 | Easy |
+| 🔴 Target health check (HTTP probe via Tor) | 2 | Medium |
+| 🔴 WireGuard interface health check | 2 | Medium |
+| 🔴 Descriptor age emergency republish | 2 | Easy |
+| 🔴 Graceful shutdown | 2 | Medium |
+| 🔴 Clock drift detection | 2 | Easy |
+| 🔴 Encrypted config & Argon2 key derivation | 3 | Hard |
+| 🔴 Repair engine wired into scheduler | 3 | Medium |
+| 🔴 Filesystem & systemd sandbox hardening | 3 | Easy |
+| 🔴 Prometheus metrics export | 3 | Medium |
+| 🔴 Intro point validation before merge | 3 | Medium |
+| 🔴 Circuit-aware HSPOST with verification | 3 | Hard |
+| 🔴 Redundant Tor instances (primary + standby) | 4 | Hard |
+| 🔴 Memory-safe secrets (zeroize + mlock) | 4 | Medium |
+| 🔴 Canary endpoint (self-test) | 4 | Medium |
+| 🔴 Cluster token rotation | 4 | Hard |
+| 🔴 Binary integrity & supply chain | 4 | Easy |
+| 🔴 Anti-entropy HSDir verification | 4 | Hard |
 
 ---
 
-## Development Status
+## Architecture Decisions
 
-**Current Phase**: Multi-node coordination ✅ → Merged descriptor publishing 🚧
-
-### Completed ✅
-- [x] Configuration system
-- [x] Tor ControlPort client
-- [x] WireGuard coordination transport
-- [x] Heartbeat protocol with gossip
-- [x] Peer discovery and mesh self-healing
-- [x] Dynamic WireGuard peer addition
-- [x] Cluster token authentication
-- [x] Publisher election algorithm
-- [x] Lease management
-- [x] Auto-detect single/multi-node mode
-- [x] **Tor Bootstrap Channel** - Join via master .onion (no pre-shared WireGuard info)
-- [x] **Peer lifecycle tracking** - Joining → Initializing → Healthy
-- [x] **Intro point aggregation** - Collect counts from all healthy peers
-
-### In Progress 🚧
-- [ ] Merged descriptor publishing (HSPOST) - Build merged descriptor from all nodes' intro points
-- [ ] Active HTTP health probes
-- [ ] Full integration tests
+| Decision | Why |
+|:---------|:----|
+| **Reverse-proxy model** | Each node IS a hidden service. No descriptor fetching, no backend key management. |
+| **File-based HiddenServiceDir** | Enables Tor's native PoW support. `ADD_ONION` can't do this. |
+| **WireGuard for coordination** | Fast, encrypted, kernel-level. No Tor latency for heartbeats. |
+| **Lease-based election** | No voting, no quorum, no split-brain. Deterministic priority ordering. |
+| **Gossip discovery** | Join any node → full mesh forms automatically. No topology planning. |
 
 ---
 
 ## Documentation
 
-- [Configuration Reference](docs/CONFIG.md) - All config options explained
-- [Protocol Specification](docs/PROTOCOL.md) - Message types and state machine
-- [Security Guidelines](docs/SECURITY.md) - Deployment security best practices
-- [Architecture Deep Dive](docs/ARCHITECTURE.md) - Detailed design decisions
-- [Challenges & Solutions](docs/CHALLENGES.md) - Technical challenges addressed
-- [Development Guide](docs/DEVELOPMENT.md) - Building and contributing
-- [Roadmap](docs/ROADMAP.md) - Project phases and progress
-
----
-
-## Deployment
-
-### Prerequisites
-- Ubuntu 22.04+ (or similar Linux)
-- Tor daemon (installed by deploy script)
-- WireGuard (installed by deploy script)
-- Network connectivity between nodes on UDP/51820
-
-### Using Deploy Script
-
-The deploy script handles everything automatically:
-
-```bash
-# Download and run (first node)
-curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \
-  --init \
-  --target your-real-service.onion \
-  --endpoint YOUR_PUBLIC_IP:51820
-```
-
-The script will:
-1. Install dependencies (Tor, WireGuard, Rust)
-2. Clone and build RustBalance
-3. Generate cryptographic keys
-4. Configure Tor hidden service
-5. Set up WireGuard interface
-6. Create systemd service
-7. Output join command for additional nodes
-
-See [testing/deploy.sh](testing/deploy.sh) for full source.
+| Document | Description |
+|:---------|:------------|
+| [docs/CONFIG.md](docs/CONFIG.md) | Configuration reference |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Message types and state machine |
+| [docs/SECURITY.md](docs/SECURITY.md) | Security model and deployment guidelines |
+| [docs/CHALLENGES.md](docs/CHALLENGES.md) | Technical challenges addressed |
+| [Documentation/](Documentation/) | Phase 1–4 hardening development plans |
 
 ---
 
@@ -358,6 +202,6 @@ MIT
 
 ## References
 
-- [Onionbalance Documentation](https://onionbalance-v3.readthedocs.io/)
-- [Tor Proposal 307: Onionbalance for v3](https://spec.torproject.org/proposals/307-onionbalance-v3.html)
 - [Tor Proposal 224: v3 Onion Services](https://spec.torproject.org/proposals/224-rend-spec-ng.html)
+- [Tor Proposal 307: Onionbalance for v3](https://spec.torproject.org/proposals/307-onionbalance-v3.html)
+- [Onionbalance Documentation](https://onionservices.torproject.org/apps/base/onionbalance/)
