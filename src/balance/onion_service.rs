@@ -208,7 +208,8 @@ impl OnionService {
         info!("Reverse proxy listening on 127.0.0.1:{}", self.local_port);
         info!(
             "Proxying to {}:{} via SOCKS{}",
-            self.target_address, self.target_port,
+            self.target_address,
+            self.target_port,
             if self.use_tls { " (HTTPS)" } else { "" }
         );
 
@@ -225,8 +226,12 @@ impl OnionService {
         loop {
             match listener.accept().await {
                 Ok((client, addr)) => {
-                    let count = connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    info!("Session #{}: New connection from {} -> proxying to {}", count, addr, self.target_address);
+                    let count =
+                        connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    info!(
+                        "Session #{}: New connection from {} -> proxying to {}",
+                        count, addr, self.target_address
+                    );
 
                     let target = self.target_address.clone();
                     let target_port = self.target_port;
@@ -319,7 +324,15 @@ impl OnionService {
         }
 
         // Not a join request - proxy normally
-        Self::handle_connection(client, target, target_port, use_tls, socks_port, master_address).await
+        Self::handle_connection(
+            client,
+            target,
+            target_port,
+            use_tls,
+            socks_port,
+            master_address,
+        )
+        .await
     }
 
     /// Handle a single proxied connection
@@ -407,29 +420,29 @@ impl OnionService {
         // 2. The .onion address is cryptographic authentication
         // 3. Most .onion sites use self-signed certificates
         let is_onion = target_host.ends_with(".onion");
-        
+
         let tls_config = if is_onion {
             // Use a permissive verifier for .onion targets
             rustls::ClientConfig::builder_with_provider(
-                rustls::crypto::ring::default_provider().into()
+                rustls::crypto::ring::default_provider().into(),
             )
-                .with_safe_default_protocol_versions()
-                .context("Failed to set TLS protocol versions")?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(OnionCertVerifier))
-                .with_no_client_auth()
+            .with_safe_default_protocol_versions()
+            .context("Failed to set TLS protocol versions")?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(OnionCertVerifier))
+            .with_no_client_auth()
         } else {
             // Use standard webpki roots for clearnet targets
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            
+
             rustls::ClientConfig::builder_with_provider(
-                rustls::crypto::ring::default_provider().into()
+                rustls::crypto::ring::default_provider().into(),
             )
-                .with_safe_default_protocol_versions()
-                .context("Failed to set TLS protocol versions")?
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+            .with_safe_default_protocol_versions()
+            .context("Failed to set TLS protocol versions")?
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
         };
 
         let connector = TlsConnector::from(Arc::new(tls_config));
@@ -444,11 +457,20 @@ impl OnionService {
             .await
             .context("TLS handshake failed")?;
 
-        debug!("TLS handshake completed for {} (onion={}, cert verification skipped={})", 
-               target_host, is_onion, is_onion);
+        debug!(
+            "TLS handshake completed for {} (onion={}, cert verification skipped={})",
+            target_host, is_onion, is_onion
+        );
 
         // Now proxy with Host header rewriting over TLS connection
-        Self::proxy_with_host_rewrite_tls(client, tls_stream, target_host, target_port, master_address).await
+        Self::proxy_with_host_rewrite_tls(
+            client,
+            tls_stream,
+            target_host,
+            target_port,
+            master_address,
+        )
+        .await
     }
 
     /// Proxy connection with TLS backend (separate impl for type safety)
@@ -477,14 +499,25 @@ impl OnionService {
         // Spawn task to forward requests client -> server with Host rewriting
         let target_for_task = target_with_port.clone();
         let request_forwarder = async move {
-            Self::forward_requests_with_rewrite(&mut client_reader, &mut tls_writer, &target_for_task).await
+            Self::forward_requests_with_rewrite(
+                &mut client_reader,
+                &mut tls_writer,
+                &target_for_task,
+            )
+            .await
         };
 
         // Spawn task to forward responses server -> client WITH header rewriting
         let master_for_task = master_address.to_string();
         let target_for_response = target_host.to_string();
         let response_forwarder = async move {
-            Self::forward_responses_with_rewrite(&mut tls_reader, &mut client_write, &target_for_response, &master_for_task).await
+            Self::forward_responses_with_rewrite(
+                &mut tls_reader,
+                &mut client_write,
+                &target_for_response,
+                &master_for_task,
+            )
+            .await
         };
 
         tokio::select! {
@@ -531,14 +564,25 @@ impl OnionService {
         // Spawn task to forward requests client -> server with Host rewriting
         let target_for_task = target_with_port.clone();
         let request_forwarder = async move {
-            Self::forward_requests_with_rewrite(&mut client_reader, &mut socks_write, &target_for_task).await
+            Self::forward_requests_with_rewrite(
+                &mut client_reader,
+                &mut socks_write,
+                &target_for_task,
+            )
+            .await
         };
 
         // Spawn task to forward responses server -> client WITH header rewriting
         let master_for_task = master_address.to_string();
         let target_for_response = target_host.to_string();
         let response_forwarder = async move {
-            Self::forward_responses_with_rewrite(&mut socks_reader, &mut client_write, &target_for_response, &master_for_task).await
+            Self::forward_responses_with_rewrite(
+                &mut socks_reader,
+                &mut client_write,
+                &target_for_response,
+                &master_for_task,
+            )
+            .await
         };
 
         tokio::select! {
@@ -704,8 +748,13 @@ impl OnionService {
 
                 // Rewrite Location header
                 if lower.starts_with("location:") {
-                    let new_header = Self::rewrite_location(&header_line, target_host, master_address);
-                    debug!("Rewrote Location header: {} -> {}", header_line.trim(), new_header.trim());
+                    let new_header =
+                        Self::rewrite_location(&header_line, target_host, master_address);
+                    debug!(
+                        "Rewrote Location header: {} -> {}",
+                        header_line.trim(),
+                        new_header.trim()
+                    );
                     writer.write_all(new_header.as_bytes()).await?;
                 }
                 // Rewrite Set-Cookie header
@@ -737,8 +786,7 @@ impl OnionService {
                         is_chunked = true;
                     }
                     writer.write_all(header_line.as_bytes()).await?;
-                }
-                else {
+                } else {
                     writer.write_all(header_line.as_bytes()).await?;
                 }
             }
@@ -791,14 +839,14 @@ impl OnionService {
             if n == 0 {
                 return Ok(());
             }
-            
+
             // Parse chunk size (hex)
             let size_str = size_line.trim().split(';').next().unwrap_or("0");
             let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
-            
+
             // Write chunk size line
             writer.write_all(size_line.as_bytes()).await?;
-            
+
             if chunk_size == 0 {
                 // Last chunk - read and forward trailing CRLF
                 let mut trailer = String::new();
@@ -806,7 +854,7 @@ impl OnionService {
                 writer.write_all(trailer.as_bytes()).await?;
                 break;
             }
-            
+
             // Read and forward chunk data
             let mut remaining = chunk_size;
             let mut buf = vec![0u8; 8192.min(remaining)];
@@ -820,13 +868,13 @@ impl OnionService {
                 writer.write_all(&buf[..n]).await?;
                 remaining -= n;
             }
-            
+
             // Read and forward trailing CRLF
             let mut crlf = String::new();
             reader.read_line(&mut crlf).await?;
             writer.write_all(crlf.as_bytes()).await?;
         }
-        
+
         Ok(())
     }
 
@@ -842,12 +890,12 @@ impl OnionService {
         if parts.len() != 2 {
             return header.to_string();
         }
-        
+
         let url = parts[1].trim();
-        
+
         // Target without .onion suffix for matching
         let target_base = target_host.trim_end_matches(".onion");
-        
+
         // Check if URL points to the target
         // Handle http://target.onion, https://target.onion, target.onion
         for prefix in &[
@@ -874,12 +922,12 @@ impl OnionService {
                 } else {
                     format!("/{}", remainder)
                 };
-                
+
                 // Return relative path (browser will resolve against current origin)
                 return format!("Location: {}\r\n", path);
             }
         }
-        
+
         // Not a target URL, pass through unchanged
         header.to_string()
     }
@@ -893,10 +941,10 @@ impl OnionService {
         if parts.len() != 2 {
             return header.to_string();
         }
-        
+
         let cookie_parts: Vec<&str> = parts[1].split(';').collect();
         let mut new_parts: Vec<&str> = Vec::new();
-        
+
         for part in cookie_parts {
             let trimmed = part.trim().to_lowercase();
             // Skip Domain= attribute
@@ -904,7 +952,7 @@ impl OnionService {
                 new_parts.push(part);
             }
         }
-        
+
         format!("Set-Cookie:{}\r\n", new_parts.join(";").trim_end())
     }
 
@@ -918,36 +966,36 @@ impl OnionService {
         if parts.len() != 2 {
             return header.to_string();
         }
-        
+
         let header_name = parts[0];
         let csp_value = parts[1];
-        
+
         // Target variations to replace
         let target_base = target_host.trim_end_matches(".onion");
         let master_base = master_address.trim_end_matches(".onion");
-        
+
         // Replace all occurrences of target with master
         // Handle both http:// and https:// URLs
         let mut result = csp_value.to_string();
-        
+
         // Replace https://target.onion with https://master.onion
         result = result.replace(
             &format!("https://{}.onion", target_base),
-            &format!("https://{}.onion", master_base)
+            &format!("https://{}.onion", master_base),
         );
-        
+
         // Replace http://target.onion with http://master.onion
         result = result.replace(
             &format!("http://{}.onion", target_base),
-            &format!("http://{}.onion", master_base)
+            &format!("http://{}.onion", master_base),
         );
-        
+
         // Replace bare target.onion references
         result = result.replace(
             &format!("{}.onion", target_base),
-            &format!("{}.onion", master_base)
+            &format!("{}.onion", master_base),
         );
-        
+
         format!("{}:{}\r\n", header_name, result.trim_end())
     }
 }

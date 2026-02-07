@@ -372,16 +372,16 @@ fn set_restrictive_permissions(path: &std::path::Path) -> Result<()> {
 #[cfg(unix)]
 fn set_tor_ownership(path: &std::path::Path) -> Result<()> {
     use std::process::Command;
-    
+
     // Try to chown to debian-tor (Debian/Ubuntu) or _tor (macOS) or tor (other)
     let users_to_try = ["debian-tor", "_tor", "tor"];
-    
+
     for user in users_to_try {
         let result = Command::new("chown")
             .arg(format!("{}:{}", user, user))
             .arg(path)
             .output();
-        
+
         if let Ok(output) = result {
             if output.status.success() {
                 tracing::debug!("Set ownership of {:?} to {}", path, user);
@@ -389,7 +389,7 @@ fn set_tor_ownership(path: &std::path::Path) -> Result<()> {
             }
         }
     }
-    
+
     // If we couldn't set ownership, log a warning but don't fail
     // This might happen if running as non-root
     tracing::warn!(
@@ -424,11 +424,11 @@ fn set_tor_ownership(_path: &std::path::Path) -> Result<()> {
 /// before Tor starts, so Tor uses the master's identity instead of generating a new one.
 pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) -> Result<()> {
     use std::fs;
-    
+
     // Create directory if it doesn't exist
     fs::create_dir_all(hs_dir)
         .with_context(|| format!("Failed to create HS directory: {:?}", hs_dir))?;
-    
+
     // Set directory permissions to 700 and ownership to Tor user
     #[cfg(unix)]
     {
@@ -438,66 +438,66 @@ pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) 
         std::fs::set_permissions(hs_dir, perms)?;
     }
     set_tor_ownership(hs_dir)?;
-    
+
     // === Write secret key file ===
     // Format: "== ed25519v1-secret: type0 ==" (32 bytes, null-padded) + 64-byte expanded key
     let secret_path = hs_dir.join("hs_ed25519_secret_key");
-    
+
     let mut secret_data = Vec::with_capacity(96);
-    
+
     // Header: "== ed25519v1-secret: type0 ==" null-padded to 32 bytes
     let header = b"== ed25519v1-secret: type0 ==";
     secret_data.extend_from_slice(header);
     // Pad with zeros to 32 bytes
     secret_data.resize(32, 0);
-    
+
     // Expanded key: clamped private scalar (32 bytes) + PRF secret (32 bytes)
     secret_data.extend_from_slice(identity.private_scalar());
     secret_data.extend_from_slice(identity.prf_secret());
-    
+
     fs::write(&secret_path, &secret_data)
         .with_context(|| format!("Failed to write secret key: {:?}", secret_path))?;
-    
+
     // Set permissions to 600 and ownership to Tor user (Unix only)
     set_restrictive_permissions(&secret_path)?;
     set_tor_ownership(&secret_path)?;
-    
+
     tracing::info!("Wrote hs_ed25519_secret_key to {:?}", secret_path);
-    
+
     // === Write public key file ===
     // Format: "== ed25519v1-public: type0 ==" (32 bytes, null-padded) + 32-byte public key
     let public_path = hs_dir.join("hs_ed25519_public_key");
-    
+
     let mut public_data = Vec::with_capacity(64);
-    
+
     // Header
     let pub_header = b"== ed25519v1-public: type0 ==";
     public_data.extend_from_slice(pub_header);
     public_data.resize(32, 0);
-    
+
     // Public key
     public_data.extend_from_slice(&identity.public_key_bytes());
-    
+
     fs::write(&public_path, &public_data)
         .with_context(|| format!("Failed to write public key: {:?}", public_path))?;
-    
+
     set_restrictive_permissions(&public_path)?;
     set_tor_ownership(&public_path)?;
-    
+
     tracing::info!("Wrote hs_ed25519_public_key to {:?}", public_path);
-    
+
     // === Write hostname file ===
     let hostname_path = hs_dir.join("hostname");
     let onion_addr = identity.onion_address();
-    
+
     fs::write(&hostname_path, format!("{}\n", onion_addr))
         .with_context(|| format!("Failed to write hostname: {:?}", hostname_path))?;
-    
+
     set_restrictive_permissions(&hostname_path)?;
     set_tor_ownership(&hostname_path)?;
-    
+
     tracing::info!("Wrote hostname {} to {:?}", onion_addr, hostname_path);
-    
+
     Ok(())
 }
 

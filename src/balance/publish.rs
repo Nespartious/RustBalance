@@ -2,8 +2,8 @@
 //!
 //! Builds and uploads the master descriptor to HSDirs.
 
-use crate::crypto::{DescriptorBuilder, MasterIdentity};
 use crate::crypto::blinding::current_and_next_time_periods;
+use crate::crypto::{DescriptorBuilder, MasterIdentity};
 use crate::tor::{IntroductionPoint, TorController};
 use anyhow::Result;
 use std::time::SystemTime;
@@ -88,7 +88,10 @@ impl Publisher {
             );
             tor.upload_hs_descriptor(&output.descriptor, &onion_addr, &[])
                 .await?;
-            info!("HSPOST for {} period accepted (rev {})", period_label, self.revision_counter);
+            info!(
+                "HSPOST for {} period accepted (rev {})",
+                period_label, self.revision_counter
+            );
         }
 
         self.last_publish = Some(SystemTime::now());
