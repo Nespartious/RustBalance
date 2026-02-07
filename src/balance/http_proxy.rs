@@ -44,7 +44,7 @@ impl HttpProxy {
     pub fn new(config: HttpProxyConfig) -> Result<Self> {
         // Build reqwest client with SOCKS5h proxy for .onion resolution
         let socks_url = format!("socks5h://{}", config.socks_proxy);
-        
+
         let client = reqwest::Client::builder()
             .redirect(Policy::none()) // Don't follow redirects - we need to rewrite them!
             .proxy(reqwest::Proxy::all(&socks_url)
@@ -53,12 +53,12 @@ impl HttpProxy {
             .connect_timeout(Duration::from_secs(60))
             .build()
             .context("Failed to build HTTP client")?;
-        
+
         info!(
             "HTTP proxy configured: {} -> {} via {}",
             config.master_address, config.backend_address, socks_url
         );
-        
+
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -70,30 +70,31 @@ impl HttpProxy {
         let listener = TcpListener::bind(self.config.listen_addr)
             .await
             .with_context(|| format!("Failed to bind to {}", self.config.listen_addr))?;
-        
-        info!("HTTP reverse proxy listening on {}", self.config.listen_addr);
-        info!("Proxying {} -> {}", self.config.master_address, self.config.backend_address);
+
+        info!(
+            "HTTP reverse proxy listening on {}",
+            self.config.listen_addr
+        );
+        info!(
+            "Proxying {} -> {}",
+            self.config.master_address, self.config.backend_address
+        );
 
         loop {
             let (stream, addr) = listener.accept().await?;
             let io = TokioIo::new(stream);
-            
+
             let config = Arc::clone(&self.config);
             let client = self.client.clone();
-            
+
             tokio::spawn(async move {
                 let service = service_fn(|req| {
                     let config = Arc::clone(&config);
                     let client = client.clone();
-                    async move {
-                        handle_request(req, config, client, addr).await
-                    }
+                    async move { handle_request(req, config, client, addr).await }
                 });
-                
-                if let Err(e) = http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await
-                {
+
+                if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
                     debug!("Connection error from {}: {}", addr, e);
                 }
             });
@@ -110,26 +111,21 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    
+
     debug!("Session from {}: {} {}", client_addr, method, uri);
-    
+
     match forward_to_backend(req, &config, &client).await {
         Ok(response) => {
-            debug!(
-                "Response for {} {}: {}",
-                method,
-                uri,
-                response.status()
-            );
+            debug!("Response for {} {}: {}", method, uri, response.status());
             Ok(response)
-        }
+        },
         Err(e) => {
             error!("Proxy error for {} {}: {}", method, uri, e);
             Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("Proxy error: {}", e),
             ))
-        }
+        },
     }
 }
 
@@ -147,7 +143,7 @@ async fn forward_to_backend(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    
+
     // Construct full backend URL
     let backend_url = format!(
         "http://{}:{}{}",
@@ -155,15 +151,15 @@ async fn forward_to_backend(
         config.backend_port,
         path
     );
-    
+
     debug!("Forwarding to backend: {}", backend_url);
-    
+
     // ========================================
     // 2. COPY REQUEST METHOD AND HEADERS
     // ========================================
     let method = convert_method(req.method())?;
     let headers = req.headers().clone();
-    
+
     // Read request body
     let body_bytes = req
         .into_body()
@@ -171,9 +167,9 @@ async fn forward_to_backend(
         .await
         .context("Failed to read request body")?
         .to_bytes();
-    
+
     let mut req_builder = client.request(method, &backend_url);
-    
+
     // Forward headers, but rewrite Host to backend
     for (name, value) in headers.iter() {
         let name_lower = name.as_str().to_lowercase();
@@ -187,12 +183,12 @@ async fn forward_to_backend(
             req_builder = req_builder.header(name, value);
         }
     }
-    
+
     // Attach body if present
     if !body_bytes.is_empty() {
         req_builder = req_builder.body(body_bytes.to_vec());
     }
-    
+
     // ========================================
     // 3. SEND REQUEST TO BACKEND
     // ========================================
@@ -200,20 +196,20 @@ async fn forward_to_backend(
         .send()
         .await
         .context("Failed to connect to backend")?;
-    
+
     // ========================================
     // 4. PROCESS RESPONSE AND REWRITE HEADERS
     // ========================================
     let status = StatusCode::from_u16(backend_response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    
+
     let mut response = Response::builder().status(status);
-    
+
     // Iterate through all backend response headers and rewrite as needed
     for (name, value) in backend_response.headers().iter() {
         let name_str = name.as_str();
         let name_lower = name_str.to_lowercase();
-        
+
         if name_lower == "location" {
             // REWRITE LOCATION HEADERS (for redirects)
             if let Ok(location) = value.to_str() {
@@ -232,7 +228,7 @@ async fn forward_to_backend(
             response = response.header(name_str, value);
         }
     }
-    
+
     // ========================================
     // 5. READ RESPONSE BODY AND RETURN
     // ========================================
@@ -240,10 +236,10 @@ async fn forward_to_backend(
         .bytes()
         .await
         .context("Failed to read backend response body")?;
-    
-    Ok(response
+
+    response
         .body(Full::new(body_bytes))
-        .context("Failed to build response")?)
+        .context("Failed to build response")
 }
 
 /// Rewrite Location header to keep user on master address
@@ -255,7 +251,7 @@ fn rewrite_location(location: &str, config: &HttpProxyConfig) -> String {
         format!("http://{}", config.backend_address),
         format!("https://{}", config.backend_address),
     ];
-    
+
     for pattern in &backend_patterns {
         if location.starts_with(pattern) {
             // Extract the path after the backend address and make it relative
@@ -266,7 +262,7 @@ fn rewrite_location(location: &str, config: &HttpProxyConfig) -> String {
             return path.to_string();
         }
     }
-    
+
     // Keep everything else as-is:
     // - External redirects to other .onion addresses
     // - Already relative paths (e.g., "/login")
@@ -277,13 +273,15 @@ fn rewrite_location(location: &str, config: &HttpProxyConfig) -> String {
 /// Rewrite Set-Cookie header to remove Domain= restrictions
 fn rewrite_cookie(cookie: &str) -> String {
     // Remove Domain= attributes so cookies work with any domain (proxy or direct)
-    let parts: Vec<&str> = cookie.split(';').collect();
-    let filtered: Vec<&str> = parts
-        .into_iter()
+    // Trim each part to avoid double-spacing when rejoining
+    let filtered: Vec<String> = cookie
+        .split(';')
+        .map(|p| p.trim())
         .filter(|part| {
-            let trimmed = part.trim().to_lowercase();
-            !trimmed.starts_with("domain=")
+            let lower = part.to_lowercase();
+            !lower.starts_with("domain=")
         })
+        .map(|s| s.to_string())
         .collect();
     filtered.join("; ")
 }
@@ -310,9 +308,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .status(status)
         .header("Content-Type", "text/plain")
         .body(Full::new(Bytes::from(message.to_string())))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from("Internal Server Error")))
-        })
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("Internal Server Error"))))
 }
 
 #[cfg(test)]
@@ -323,30 +319,31 @@ mod tests {
     fn test_rewrite_location_absolute_to_relative() {
         let config = HttpProxyConfig {
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
-            backend_address: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".to_string(),
+            backend_address: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"
+                .to_string(),
             backend_port: 80,
             socks_proxy: "127.0.0.1:9050".to_string(),
             master_address: "master.onion".to_string(),
         };
-        
+
         // Backend URL should become relative
         let result = rewrite_location(
             "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/search?q=test",
             &config,
         );
         assert_eq!(result, "/search?q=test");
-        
+
         // With port
         let result = rewrite_location(
             "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:80/",
             &config,
         );
         assert_eq!(result, "/");
-        
+
         // External should pass through
         let result = rewrite_location("https://example.com/page", &config);
         assert_eq!(result, "https://example.com/page");
-        
+
         // Relative should pass through
         let result = rewrite_location("/login", &config);
         assert_eq!(result, "/login");
@@ -357,7 +354,7 @@ mod tests {
         // Remove Domain= attribute
         let result = rewrite_cookie("session=abc123; Domain=.example.com; Path=/; HttpOnly");
         assert_eq!(result, "session=abc123; Path=/; HttpOnly");
-        
+
         // Keep cookies without Domain
         let result = rewrite_cookie("token=xyz; Path=/; Secure");
         assert_eq!(result, "token=xyz; Path=/; Secure");
