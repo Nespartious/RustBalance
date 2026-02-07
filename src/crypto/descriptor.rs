@@ -57,6 +57,19 @@ impl<'a> DescriptorBuilder<'a> {
     /// Build a complete v3 descriptor
     pub fn build(&self, intro_points: &[IntroductionPoint]) -> Result<DescriptorOutput> {
         let time_period = current_time_period();
+        self.build_for_period(intro_points, time_period)
+    }
+
+    /// Build a complete v3 descriptor for a specific time period
+    ///
+    /// Per rend-spec-v3 §2.2.1, a service must publish descriptors for both
+    /// the current AND the next time period. Use this method to build
+    /// a descriptor for each.
+    pub fn build_for_period(
+        &self,
+        intro_points: &[IntroductionPoint],
+        time_period: u64,
+    ) -> Result<DescriptorOutput> {
         // Convert time_period to timestamp for blinding (multiply by period length in seconds)
         let time_period_secs = time_period * 86400;
 

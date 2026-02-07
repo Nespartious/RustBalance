@@ -35,10 +35,15 @@
 set -e
 
 REPO_URL="https://github.com/Nespartious/RustBalance.git"
-REPO_BRANCH="main"  # Branch to clone
+REPO_BRANCH="feature/separate-node-addresses"  # Branch to clone (testing feature branch)
 INSTALL_DIR="$HOME/rustbalance"
 CONFIG_DIR="/etc/rustbalance"
+# DEPRECATED: Legacy HS dir path (kept for backward compatibility)
 HS_DIR="/var/lib/tor/rustbalance_hs"
+# Node HS directory - RustBalance writes the MASTER keys here before Tor starts.
+# This means ALL nodes run AS the master identity (same .onion address).
+# Tor will read these keys and use them for its hidden service.
+NODE_HS_DIR="/var/lib/tor/rustbalance_node_hs"
 LOG_FILE="$HOME/rustbalance_deploy.log"
 
 # Colors for output
@@ -79,6 +84,7 @@ PEER_PUBKEY=""
 NODE_PRIORITY=10
 CLUSTER_TOKEN=""
 JOIN_SECRET=""
+USE_HTTPS=false
 
 print_usage() {
     echo "Usage:"
@@ -100,6 +106,7 @@ print_usage() {
     echo "  --cluster-token   Cluster authentication token (for --join)"
     echo "  --join-secret     Join secret for Tor Bootstrap Channel (for --join)"
     echo "  --priority        Node priority, lower = higher priority (default: 10)"
+    echo "  --https           Use HTTPS when connecting to target (for targets that require TLS)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -151,6 +158,10 @@ while [[ $# -gt 0 ]]; do
         --join-secret)
             JOIN_SECRET="$2"
             shift 2
+            ;;
+        --https)
+            USE_HTTPS=true
+            shift
             ;;
         --help|-h)
             print_usage
@@ -218,10 +229,15 @@ clean() {
         sudo ip link delete wg-rb 2>/dev/null || true
     fi
     
-    # Remove hidden service directory
+    # Remove hidden service directories
     if [ -d "$HS_DIR" ]; then
-        log "Removing hidden service directory..."
+        log "Removing legacy hidden service directory..."
         sudo rm -rf "$HS_DIR"
+    fi
+    
+    if [ -d "$NODE_HS_DIR" ]; then
+        log "Removing node hidden service directory..."
+        sudo rm -rf "$NODE_HS_DIR"
     fi
     
     # Remove config directory
@@ -328,18 +344,24 @@ configure_tor() {
     log "Tor configured"
 }
 
-# Setup hidden service directory with correct ownership
+# Setup hidden service directories with correct ownership
 setup_hs_directory() {
-    log "Setting up hidden service directory..."
+    log "Setting up hidden service directories..."
     
-    # Create directory if it doesn't exist
+    # Create legacy directory (for backward compatibility, unused in multi-node)
     sudo mkdir -p "$HS_DIR"
-    
-    # Set correct ownership (debian-tor on Debian/Ubuntu)
     sudo chown -R debian-tor:debian-tor "$HS_DIR"
     sudo chmod 700 "$HS_DIR"
     
-    log "Hidden service directory created at $HS_DIR"
+    # Create node HS directory - RustBalance writes MASTER keys here before Tor starts.
+    # This makes all nodes run AS the master identity (same .onion address).
+    sudo mkdir -p "$NODE_HS_DIR"
+    sudo chown -R debian-tor:debian-tor "$NODE_HS_DIR"
+    sudo chmod 700 "$NODE_HS_DIR"
+    
+    log "Hidden service directories created:"
+    log "  Legacy (unused): $HS_DIR"
+    log "  Node HS:         $NODE_HS_DIR"
 }
 
 # Clone and build RustBalance
@@ -390,7 +412,7 @@ StandardError=journal
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/tor/rustbalance_hs /etc/rustbalance
+ReadWritePaths=/var/lib/tor/rustbalance_hs /var/lib/tor/rustbalance_node_hs /etc/rustbalance
 PrivateTmp=yes
 
 [Install]
@@ -540,6 +562,13 @@ init_first_node() {
     echo "$JOIN_SECRET_GENERATED" | sudo tee "$CONFIG_DIR/join_secret.txt" > /dev/null
     log "Generated join_secret for Tor Bootstrap Channel"
     
+    # Determine target port based on HTTPS setting
+    if [ "$USE_HTTPS" = true ]; then
+        TARGET_PORT=443
+    else
+        TARGET_PORT=80
+    fi
+    
     # Derive master onion address (run rustbalance to compute it)
     # For now, we'll let rustbalance compute it on first run
     # We need to create a minimal config first
@@ -552,12 +581,16 @@ init_first_node() {
 
 # Root-level settings
 local_port = 8080
+# DEPRECATED: Legacy field, kept for backward compatibility
 hidden_service_dir = "/var/lib/tor/rustbalance_hs"
 
 [node]
 id = "$NODE_ID"
 priority = $NODE_PRIORITY
 clock_skew_tolerance_secs = 5
+# Node HS directory - RustBalance writes MASTER keys here before Tor starts.
+# This makes all nodes run AS the master identity (same .onion address).
+hidden_service_dir = "/var/lib/tor/rustbalance_node_hs"
 
 [master]
 onion_address = "PENDING_FIRST_RUN"
@@ -565,7 +598,8 @@ identity_key_path = "$MASTER_KEY_FILE"
 
 [target]
 onion_address = "$TARGET_ONION"
-port = 80
+port = $TARGET_PORT
+use_tls = $USE_HTTPS
 
 [tor]
 control_host = "127.0.0.1"
@@ -642,6 +676,12 @@ EOF
     echo ""
     echo "Run this command on each additional node to join the cluster:"
     echo ""
+    # Build HTTPS flag string if needed
+    local HTTPS_FLAG=""
+    if [ "$USE_HTTPS" = true ]; then
+        HTTPS_FLAG=" \\\\
+  --https"
+    fi
     if [ "$MASTER_ONION" != "PENDING_FIRST_RUN" ]; then
         echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \\"
         echo "  --join \\"
@@ -651,7 +691,14 @@ EOF
         echo "  --peer-endpoint \"$ENDPOINT\" \\"
         echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
         echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-        echo "  --join-secret \"$JOIN_SECRET_GENERATED\"${NC}"
+        echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
+        if [ "$USE_HTTPS" = true ]; then
+            echo " \\"
+            echo "  --https"
+        else
+            echo ""
+        fi
+        echo -e "${NC}"
     else
         echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \\"
         echo "  --join \\"
@@ -661,7 +708,14 @@ EOF
         echo "  --peer-endpoint \"$ENDPOINT\" \\"
         echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
         echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-        echo "  --join-secret \"$JOIN_SECRET_GENERATED\"${NC}"
+        echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
+        if [ "$USE_HTTPS" = true ]; then
+            echo " \\"
+            echo "  --https"
+        else
+            echo ""
+        fi
+        echo -e "${NC}"
     fi
     echo ""
     echo "Or if you already have the binary, run:"
@@ -673,7 +727,14 @@ EOF
     echo "  --peer-endpoint \"$ENDPOINT\" \\"
     echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
     echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-    echo "  --join-secret \"$JOIN_SECRET_GENERATED\"${NC}"
+    echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
+    if [ "$USE_HTTPS" = true ]; then
+        echo " \\"
+        echo "  --https"
+    else
+        echo ""
+    fi
+    echo -e "${NC}"
     echo ""
     echo -e "${YELLOW}IMPORTANT: The service will auto-start after deployment.${NC}"
     echo "The script will wait for the hidden service to become reachable."
@@ -786,6 +847,13 @@ join_cluster() {
     OUR_ENDPOINT="${OUR_IP}:51820"
     log "Our external endpoint for gossip: $OUR_ENDPOINT"
     
+    # Determine target port based on HTTPS setting
+    if [ "$USE_HTTPS" = true ]; then
+        TARGET_PORT=443
+    else
+        TARGET_PORT=80
+    fi
+    
     # Create config file
     log "Creating configuration file..."
     sudo tee "$CONFIG_DIR/config.toml" > /dev/null << EOF
@@ -794,12 +862,16 @@ join_cluster() {
 
 # Root-level settings
 local_port = 8080
+# DEPRECATED: Legacy field, kept for backward compatibility
 hidden_service_dir = "/var/lib/tor/rustbalance_hs"
 
 [node]
 id = "$NODE_ID"
 priority = $NODE_PRIORITY
 clock_skew_tolerance_secs = 5
+# Node HS directory - RustBalance writes MASTER keys here before Tor starts.
+# This makes all nodes run AS the master identity (same .onion address).
+hidden_service_dir = "/var/lib/tor/rustbalance_node_hs"
 
 [master]
 onion_address = "$MASTER_ONION"
@@ -807,7 +879,8 @@ identity_key_path = "$MASTER_KEY_FILE"
 
 [target]
 onion_address = "$TARGET_ONION"
-port = 80
+port = $TARGET_PORT
+use_tls = $USE_HTTPS
 
 [tor]
 control_host = "127.0.0.1"
@@ -913,8 +986,8 @@ wait_for_hidden_service() {
     sleep 5
     
     while [ $ELAPSED -lt $MAX_WAIT ]; do
-        # Check if hostname file exists and has content
-        if [ ! -f "$HS_DIR/hostname" ]; then
+        # Check if hostname file exists (RustBalance writes master keys here)
+        if [ ! -f "$NODE_HS_DIR/hostname" ]; then
             echo -e "  [${ELAPSED}s] Waiting for hostname file..."
             sleep $CHECK_INTERVAL
             ELAPSED=$((ELAPSED + CHECK_INTERVAL))
@@ -989,24 +1062,32 @@ start_and_verify() {
     log "RustBalance service is running"
     
     # Wait for the hidden service to be configured
+    # With the new architecture, all nodes run AS the master identity.
+    # RustBalance writes master keys to NODE_HS_DIR before Tor starts.
+    # The hostname file should contain the MASTER address, not a unique node address.
     log "Waiting for Tor to configure hidden service..."
     local WAITED=0
     while [ $WAITED -lt 60 ]; do
-        if [ -f "$HS_DIR/hostname" ]; then
-            ACTUAL_ONION=$(sudo cat "$HS_DIR/hostname" 2>/dev/null)
-            if [ -n "$ACTUAL_ONION" ]; then
-                log "Hidden service hostname: $ACTUAL_ONION"
+        if [ -f "$NODE_HS_DIR/hostname" ]; then
+            NODE_ONION=$(sudo cat "$NODE_HS_DIR/hostname" 2>/dev/null)
+            if [ -n "$NODE_ONION" ]; then
+                log "Hidden service address: $NODE_ONION"
                 
-                # Update config if needed
+                # Update config with master onion if it's still PENDING
+                # (master onion is derived from master key, not from hostname file)
                 if grep -q "PENDING_FIRST_RUN" "$CONFIG_DIR/config.toml" 2>/dev/null; then
-                    log "Updating config with actual onion address..."
-                    sudo sed -i "s/PENDING_FIRST_RUN/$ACTUAL_ONION/" "$CONFIG_DIR/config.toml"
-                    echo "$ACTUAL_ONION" | sudo tee "$CONFIG_DIR/master_onion.txt" > /dev/null
-                    
-                    # Update join_info.txt with actual onion address
-                    if [ -f "$CONFIG_DIR/join_info.txt" ]; then
-                        sudo sed -i "s/PENDING_FIRST_RUN/$ACTUAL_ONION/g" "$CONFIG_DIR/join_info.txt"
-                        sudo sed -i "s/MASTER_ONION=PENDING_FIRST_RUN/MASTER_ONION=$ACTUAL_ONION/g" "$CONFIG_DIR/join_info.txt"
+                    # Try to compute master onion from key
+                    MASTER_COMPUTED=$(/usr/local/bin/rustbalance debug show-onion --key "$MASTER_KEY_FILE" 2>/dev/null || echo "")
+                    if [ -n "$MASTER_COMPUTED" ]; then
+                        log "Updating config with master onion: $MASTER_COMPUTED"
+                        sudo sed -i "s/PENDING_FIRST_RUN/$MASTER_COMPUTED/" "$CONFIG_DIR/config.toml"
+                        echo "$MASTER_COMPUTED" | sudo tee "$CONFIG_DIR/master_onion.txt" > /dev/null
+                        
+                        # Update join_info.txt with actual master onion address
+                        if [ -f "$CONFIG_DIR/join_info.txt" ]; then
+                            sudo sed -i "s/PENDING_FIRST_RUN/$MASTER_COMPUTED/g" "$CONFIG_DIR/join_info.txt"
+                            sudo sed -i "s/MASTER_ONION=PENDING_FIRST_RUN/MASTER_ONION=$MASTER_COMPUTED/g" "$CONFIG_DIR/join_info.txt"
+                        fi
                     fi
                 fi
                 break
@@ -1033,7 +1114,7 @@ show_status() {
     echo ""
     echo "RustBalance binary: /usr/local/bin/rustbalance"
     echo "Config directory:   $CONFIG_DIR"
-    echo "HS directory:       $HS_DIR"
+    echo "Node HS directory:  $NODE_HS_DIR"
     echo ""
     
     TOR_STATUS=$(sudo systemctl is-active tor@default 2>/dev/null || sudo systemctl is-active tor 2>/dev/null || echo "unknown")
@@ -1050,9 +1131,10 @@ show_status() {
         echo "Master onion (config): $MASTER_ONION_CFG"
     fi
     
-    if [ -f "$HS_DIR/hostname" ]; then
-        MASTER_ONION_ACTUAL=$(sudo cat "$HS_DIR/hostname" 2>/dev/null || echo "not yet generated")
-        echo -e "Master onion (actual): ${GREEN}$MASTER_ONION_ACTUAL${NC}"
+    # With new architecture, node address = master address (all nodes run AS master)
+    if [ -f "$NODE_HS_DIR/hostname" ]; then
+        NODE_ONION=$(sudo cat "$NODE_HS_DIR/hostname" 2>/dev/null || echo "not yet generated")
+        echo -e "HS address (should match master): ${GREEN}$NODE_ONION${NC}"
     fi
     echo ""
     

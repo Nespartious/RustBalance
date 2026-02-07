@@ -3,6 +3,7 @@
 //! Builds and uploads the master descriptor to HSDirs.
 
 use crate::crypto::{DescriptorBuilder, MasterIdentity};
+use crate::crypto::blinding::current_and_next_time_periods;
 use crate::tor::{IntroductionPoint, TorController};
 use anyhow::Result;
 use std::time::SystemTime;
@@ -52,47 +53,49 @@ impl Publisher {
             intro_points.len()
         );
 
-        // Increment revision counter
-        self.revision_counter += 1;
-        info!(
-            "Building descriptor with revision counter {}",
-            self.revision_counter
-        );
+        // Build and upload descriptors for BOTH time periods
+        // Per rend-spec-v3 §2.2.1: "A service MUST generate and upload descriptors
+        // for the current and the following time period."
+        let (tp_current, tp_next) = current_and_next_time_periods();
+        let time_periods = [tp_current, tp_next];
 
-        // Build the complete descriptor using the crypto module
-        let builder = DescriptorBuilder::new(&self.identity, self.revision_counter);
-        let output = builder.build(&intro_points)?;
+        for (i, &tp) in time_periods.iter().enumerate() {
+            let period_label = if i == 0 { "current" } else { "next" };
 
-        info!(
-            "Built descriptor with blinded key {:?}, revision {}, descriptor len {}",
-            &output.blinded_key[..8],
-            output.revision_counter,
-            output.descriptor.len()
-        );
+            // Each time period needs its own revision counter and signing key
+            self.revision_counter += 1;
+            info!(
+                "Building descriptor for {} time period (tp={}) with revision counter {}",
+                period_label, tp, self.revision_counter
+            );
 
-        // Debug: show last 500 chars of descriptor to see the signature
-        let preview = if output.descriptor.len() > 500 {
-            &output.descriptor[output.descriptor.len() - 500..]
-        } else {
-            &output.descriptor
-        };
-        info!("Descriptor end:\n{}", preview);
+            let builder = DescriptorBuilder::new(&self.identity, self.revision_counter);
+            let output = builder.build_for_period(&intro_points, tp)?;
 
-        // Upload via Tor control port
-        let onion_addr = self.identity.onion_address();
-        info!(
-            "Uploading descriptor via Tor control port for {}...",
-            onion_addr
-        );
-        tor.upload_hs_descriptor(&output.descriptor, &onion_addr, &[])
-            .await?;
-        info!("Tor upload_hs_descriptor returned");
+            info!(
+                "Built descriptor for {} period: blinded key {:?}, revision {}, len {}",
+                period_label,
+                &output.blinded_key[..8],
+                output.revision_counter,
+                output.descriptor.len()
+            );
+
+            // Upload via Tor control port
+            let onion_addr = self.identity.onion_address();
+            info!(
+                "Uploading {} period descriptor via HSPOST for {}...",
+                period_label, onion_addr
+            );
+            tor.upload_hs_descriptor(&output.descriptor, &onion_addr, &[])
+                .await?;
+            info!("HSPOST for {} period accepted (rev {})", period_label, self.revision_counter);
+        }
 
         self.last_publish = Some(SystemTime::now());
 
         info!(
-            "Descriptor published successfully (rev {})",
-            self.revision_counter
+            "Descriptors published for both time periods (tp {} and {}, latest rev {})",
+            tp_current, tp_next, self.revision_counter
         );
 
         Ok(())

@@ -242,12 +242,16 @@ fn generate_config(
 
 # Root-level settings
 local_port = 8080
+# DEPRECATED: Legacy field, kept for backward compatibility
 hidden_service_dir = "/var/lib/tor/rustbalance_hs"
 
 [node]
 id = "{node_id}"
 priority = {priority}
 clock_skew_tolerance_secs = 5
+# Node-specific hidden service directory
+# Each node gets its own unique .onion address here
+hidden_service_dir = "/var/lib/tor/rustbalance_node_hs"
 
 [master]
 onion_address = "{onion_address}"

@@ -40,13 +40,28 @@ pub async fn run(
         .map(|wg| !wg.peers.is_empty())
         .unwrap_or(false);
 
-    // Setup hidden service directory with master key (files only)
-    info!("Setting up hidden service directory...");
-    crate::balance::onion_service::setup_hs_directory(
-        &config.hidden_service_dir,
-        &config.master.identity_key_path,
-    )
-    .await?;
+    // CRITICAL: Write the master key to the HiddenServiceDir BEFORE configuring Tor.
+    // This ensures Tor uses the master's identity, not a randomly generated one.
+    // When clients connect to the master address, Tor needs the master's keys to
+    // decrypt INTRODUCE2 cells. Without this, connections will fail.
+    info!(
+        "Node hidden service directory: {}",
+        config.node.hidden_service_dir
+    );
+    
+    // Load master identity and write its keys to the HS directory
+    let master_identity = crate::crypto::load_identity_key(
+        std::path::Path::new(&config.master.identity_key_path)
+    )?;
+    
+    info!(
+        "Writing master key to HS directory: {}",
+        config.node.hidden_service_dir
+    );
+    crate::crypto::write_tor_key_files(
+        &master_identity,
+        std::path::Path::new(&config.node.hidden_service_dir),
+    )?;
 
     // Create onion service manager
     let mut onion_service = OnionService::new(&config);
@@ -57,24 +72,32 @@ pub async fn run(
         info!("Joining node: Delaying HS config until after bootstrap");
     } else {
         info!("Init node: Configuring Tor hidden service...");
+        // Tor will use the master keys we just wrote to the directory
         onion_service
-            .configure_tor_hs(&config.hidden_service_dir, 80)
+            .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
-        // Wait for Tor to create hostname file
+        // Wait for Tor to create intro points
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Read and verify hostname
-        match crate::balance::onion_service::read_hs_hostname(&config.hidden_service_dir).await {
+        // Verify hostname matches master address
+        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
+            .await
+        {
             Ok(hostname) => {
-                info!("Hidden service hostname: {}", hostname);
-                if hostname != config.master.onion_address {
+                info!("Tor HS address: {}", hostname);
+                info!("Master address: {}", config.master.onion_address);
+                // Verify they match (the node should be running AS the master address)
+                if !hostname.starts_with(&config.master.onion_address.replace(".onion", "")) {
                     warn!(
-                        "Hostname mismatch! Expected: {}, Got: {}",
+                        "HS address mismatch! Expected {}, got {}. Key write may have failed.",
                         config.master.onion_address, hostname
                     );
                 }
+                // Store in state for intro point sharing
+                let mut state = state.write().await;
+                state.node_onion_address = Some(hostname);
             },
             Err(e) => {
                 error!("Failed to read hostname: {}", e);
@@ -161,24 +184,32 @@ pub async fn run(
 
         // NOW configure the hidden service (after bootstrap attempt)
         info!("Joining node: NOW configuring Tor hidden service...");
+        // Tor will use the master keys we wrote earlier
         onion_service
-            .configure_tor_hs(&config.hidden_service_dir, 80)
+            .configure_tor_hs(&config.node.hidden_service_dir, 80)
             .await?;
 
-        // Wait for Tor to create hostname file
+        // Wait for Tor to create intro points
         info!("Waiting for Tor to initialize hidden service...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Read and verify hostname
-        match crate::balance::onion_service::read_hs_hostname(&config.hidden_service_dir).await {
+        // Verify hostname matches master address
+        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
+            .await
+        {
             Ok(hostname) => {
-                info!("Hidden service hostname: {}", hostname);
-                if hostname != config.master.onion_address {
+                info!("Tor HS address: {}", hostname);
+                info!("Master address: {}", config.master.onion_address);
+                // Verify they match (the node should be running AS the master address)
+                if !hostname.starts_with(&config.master.onion_address.replace(".onion", "")) {
                     warn!(
-                        "Hostname mismatch! Expected: {}, Got: {}",
+                        "HS address mismatch! Expected {}, got {}. Key write may have failed.",
                         config.master.onion_address, hostname
                     );
                 }
+                // Store in state for intro point sharing
+                let mut state = state.write().await;
+                state.node_onion_address = Some(hostname);
             },
             Err(e) => {
                 error!("Failed to read hostname: {}", e);
@@ -220,7 +251,7 @@ pub async fn run(
     let publish_handle =
         tokio::spawn(async move { publish_loop(state_clone, coord_clone, config_clone).await });
 
-    // Intro point refresh loop - periodically fetches our intro points from Tor
+    // Intro point refresh loop - periodically fetches and parses our own descriptor
     let state_clone = Arc::clone(&state);
     let coord_clone = Arc::clone(&coordinator);
     let config_clone = config.clone();
@@ -336,6 +367,34 @@ async fn heartbeat_loop(
         let coord = coordinator.read().await;
         if let Err(e) = coord.broadcast(&msg).await {
             warn!("Failed to send heartbeat: {}", e);
+        } else {
+            debug!("Successfully sent heartbeat to peers");
+        }
+
+        // Also broadcast our intro points with every heartbeat
+        // This ensures peers receive them even if initial messages were rejected
+        if intro_point_count > 0 {
+            let intro_points = {
+                let state = state.read().await;
+                state.own_intro_points.clone()
+            };
+
+            if !intro_points.is_empty() {
+                let intro_data: Vec<crate::coord::IntroPointData> = intro_points
+                    .iter()
+                    .map(|ip| crate::coord::IntroPointData {
+                        data: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            ip.to_bytes(),
+                        ),
+                    })
+                    .collect();
+
+                let intro_msg = CoordMessage::intro_points(config.node.id.clone(), intro_data);
+                if let Err(e) = coord.broadcast(&intro_msg).await {
+                    debug!("Failed to broadcast intro points with heartbeat: {}", e);
+                }
+            }
         }
     }
 }
@@ -557,6 +616,9 @@ async fn publish_loop(
     tokio::time::sleep(Duration::from_secs(90)).await;
 
     let mut ticker = interval(Duration::from_secs(config.publish.refresh_interval_secs));
+    // Tick immediately on first iteration (don't wait for full interval)
+    ticker.tick().await;
+    
     info!(
         "Publish loop starting, interval: {} secs",
         config.publish.refresh_interval_secs
@@ -565,8 +627,10 @@ async fn publish_loop(
     // Max intro points per descriptor (Tor spec limit)
     let max_intro_points = 20;
 
+    // Track whether Tor's auto-publish is disabled (for multi-node mode)
+    let mut auto_publish_disabled = false;
+
     loop {
-        ticker.tick().await;
 
         // Auto-detect mode: check if we have active peers
         let (has_active_peers, alive_count) = {
@@ -614,6 +678,7 @@ async fn publish_loop(
 
         if !is_publisher {
             debug!("Not publisher, skipping publish");
+            ticker.tick().await;
             continue;
         }
 
@@ -630,8 +695,64 @@ async fn publish_loop(
         let total_intro_count = own_intro_count + peer_intro_count;
 
         if !has_active_peers {
-            // Single-node mode: Tor handles publishing automatically
-            info!("Single-node mode: Tor is handling descriptor publishing (we are publisher)");
+            // Single-node mode: Tor auto-publishes for master address since we
+            // injected the master key into HiddenServiceDir. However, we still
+            // HSPOST to ensure descriptor freshness and to allow seamless
+            // transition when peers join. Using higher revision counter ensures
+            // our descriptor takes precedence.
+            info!("Single-node mode: publishing descriptor for master address via HSPOST");
+
+            // Re-enable Tor auto-publish if it was previously disabled (transition from multi → single)
+            if auto_publish_disabled {
+                info!("Single-node mode: re-enabling Tor auto-publish");
+                match crate::tor::control::TorController::connect(&config.tor).await {
+                    Ok(mut tor) => {
+                        if let Err(e) = tor.set_publish_descriptors(true).await {
+                            warn!("Failed to re-enable Tor auto-publish: {}", e);
+                        } else {
+                            auto_publish_disabled = false;
+                            info!("Tor auto-publish re-enabled for single-node mode");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to connect to Tor to re-enable auto-publish: {}", e);
+                    },
+                }
+            }
+
+            // Get our own intro points
+            let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
+                let state = state.read().await;
+                state.own_intro_points.clone()
+            };
+
+            if own_intro_points.is_empty() {
+                debug!("No intro points yet, waiting...");
+                ticker.tick().await;
+                continue;
+            }
+
+            info!(
+                "Publishing descriptor with {} intro points for master address",
+                own_intro_points.len()
+            );
+
+            // Connect to Tor and publish via HSPOST
+            match crate::tor::control::TorController::connect(&config.tor).await {
+                Ok(mut tor) => {
+                    if let Err(e) = publisher.publish(&mut tor, own_intro_points).await {
+                        warn!("Failed to publish descriptor: {}", e);
+                    } else {
+                        info!("Successfully published descriptor for master address via HSPOST");
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to Tor control port for publishing: {}",
+                        e
+                    );
+                },
+            }
         } else if total_intro_count == 0 {
             // Multi-node but no intro points collected yet
             warn!(
@@ -639,17 +760,29 @@ async fn publish_loop(
             );
         } else {
             // Multi-node mode with intro points: merge and publish
-            info!(
-                "Multi-node mode: merging {} own + {} peer intro points",
-                own_intro_count, peer_intro_count
-            );
 
-            // NOTE: We intentionally DO NOT disable Tor's auto-publishing.
-            // Setting PublishHidServDescriptors=0 causes Tor to stop maintaining
-            // intro point circuits, which kills our intro points.
-            // Instead, we let Tor publish its descriptor normally, but our merged
-            // descriptor uses revision_counter = timestamp * 3, which is always
-            // higher than Tor's ~timestamp * 2.7, so HSDirs will prefer our version.
+            // CRITICAL: Disable Tor's auto-publishing in multi-node mode.
+            // Tor's service subsystem runs upload_descriptor_to_hsdir() every second,
+            // which uses OPE-encrypted revision counters that monotonically increase.
+            // This constantly overwrites our HSPOST descriptor on HSDirs.
+            // PublishHidServDescriptors=0 only stops descriptor UPLOADS to HSDirs;
+            // intro point circuits continue to be maintained normally.
+            if !auto_publish_disabled {
+                info!("Multi-node mode: disabling Tor auto-publish to prevent HSPOST race");
+                match crate::tor::control::TorController::connect(&config.tor).await {
+                    Ok(mut tor) => {
+                        if let Err(e) = tor.set_publish_descriptors(false).await {
+                            warn!("Failed to disable Tor auto-publish: {}", e);
+                        } else {
+                            auto_publish_disabled = true;
+                            info!("Tor auto-publish disabled successfully");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to connect to Tor to disable auto-publish: {}", e);
+                    },
+                }
+            }
 
             // 1. Collect own intro points
             let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
@@ -683,6 +816,20 @@ async fn publish_loop(
                     },
                 }
             }
+
+            // Log actual counts AFTER collecting/deserializing
+            // Note: peer_intro_count from heartbeats may differ from actual data received
+            let actual_peer_count = peer_intro_points.len();
+            if actual_peer_count != peer_intro_count {
+                warn!(
+                    "Peer intro point mismatch: heartbeat reports {} but we have {} actual data entries",
+                    peer_intro_count, actual_peer_count
+                );
+            }
+            info!(
+                "Multi-node mode: merging {} own + {} peer intro points (heartbeat reported {})",
+                own_intro_points.len(), actual_peer_count, peer_intro_count
+            );
 
             // 3. Merge intro points, capping at max
             let mut merged: Vec<crate::tor::IntroductionPoint> = own_intro_points;
@@ -719,6 +866,9 @@ async fn publish_loop(
                 },
             }
         }
+        
+        // Wait for next publish interval
+        ticker.tick().await;
     }
 }
 
@@ -878,6 +1028,11 @@ async fn background_bootstrap_loop(
 /// 1. Is reported in heartbeats (intro_point_count)
 /// 2. Is broadcast to peers via IntroPoints messages
 /// 3. Is used by publisher to merge into the final descriptor
+///
+/// IMPORTANT: In the unified-master-key architecture, each node runs as the master
+/// address. The master key is written to node.hidden_service_dir before Tor starts,
+/// so Tor creates intro points for the master address. We fetch the descriptor
+/// for the master address to get the intro points Tor created.
 async fn intro_point_refresh_loop(
     state: Arc<RwLock<RuntimeState>>,
     coordinator: Arc<RwLock<Coordinator>>,
@@ -888,16 +1043,22 @@ async fn intro_point_refresh_loop(
     tokio::time::sleep(Duration::from_secs(60)).await;
 
     // Load master identity key for descriptor decryption
-    let identity = match crate::crypto::load_identity_key(&config.master.identity_key_path) {
+    // This is the same key that Tor is using (we wrote it to HS dir at startup)
+    let node_key_path = std::path::Path::new(&config.node.hidden_service_dir)
+        .join("hs_ed25519_secret_key");
+    
+    let master_identity = match crate::crypto::load_identity_key(&node_key_path) {
         Ok(id) => id,
         Err(e) => {
             error!(
-                "Failed to load master identity key for intro point parsing: {}",
-                e
+                "Failed to load master identity key from {:?} for intro point parsing: {}",
+                node_key_path, e
             );
             return Err(e);
         },
     };
+
+    info!("Loaded master identity key for intro point parsing");
 
     let mut ticker = interval(Duration::from_secs(30)); // Check every 30 seconds
 
@@ -905,6 +1066,20 @@ async fn intro_point_refresh_loop(
 
     loop {
         ticker.tick().await;
+
+        // Get the onion address from state (should be master address after HS init)
+        let node_onion_address = {
+            let state = state.read().await;
+            state.node_onion_address.clone()
+        };
+
+        let addr = match node_onion_address {
+            Some(addr) => addr,
+            None => {
+                debug!("Onion address not yet available, waiting...");
+                continue;
+            },
+        };
 
         // Connect to Tor control port
         let mut tor = match crate::tor::control::TorController::connect(&config.tor).await {
@@ -915,26 +1090,24 @@ async fn intro_point_refresh_loop(
             },
         };
 
-        // Fetch our descriptor from Tor
-        let descriptor_raw = match tor
-            .get_own_hs_descriptor(&config.master.onion_address)
-            .await
-        {
+        // Fetch the descriptor from Tor (this is the master address descriptor)
+        // Tor auto-publishes this since it has the master key in HiddenServiceDir
+        let descriptor_raw = match tor.get_own_hs_descriptor(&addr).await {
             Ok(Some(desc)) => desc,
             Ok(None) => {
-                debug!("No descriptor available yet for our service");
+                info!("No descriptor available yet for {} - waiting for Tor to publish.", addr);
                 continue;
             },
             Err(e) => {
-                debug!("Failed to get our descriptor: {}", e);
+                debug!("Failed to get descriptor: {}", e);
                 continue;
             },
         };
 
-        // Parse and decrypt the descriptor to extract intro points
+        // Parse and decrypt the descriptor using master key
         let intro_points = match crate::tor::HsDescriptor::parse_and_decrypt_with_pubkey(
             &descriptor_raw,
-            identity.public_key(),
+            master_identity.public_key(),
         ) {
             Ok(desc) => desc.introduction_points,
             Err(e) => {
@@ -948,6 +1121,8 @@ async fn intro_point_refresh_loop(
 
         let new_count = intro_points.len();
 
+        debug!("Intro point refresh loop: new_count = {}", new_count);
+
         // Check if intro points changed
         let (current_count, changed) = {
             let state = state.read().await;
@@ -956,13 +1131,19 @@ async fn intro_point_refresh_loop(
             (current, current != new_count)
         };
 
-        if changed && new_count > 0 {
-            info!(
-                "Intro points updated: {} -> {} (parsed from descriptor)",
-                current_count, new_count
-            );
+        if new_count > 0 {
+            if changed {
+                info!(
+                    "Intro points updated: {} -> {} (parsed from descriptor)",
+                    current_count, new_count
+                );
+            }
 
             // Serialize intro points for broadcast
+            // NOTE: We broadcast on EVERY tick (not just on change) because:
+            // 1. A peer that restarts needs to receive our intro points
+            // 2. IntroPoints messages may be lost if peer tracker doesn't have us yet
+            // 3. Periodic broadcast ensures eventual consistency
             let intro_data: Vec<crate::coord::IntroPointData> = intro_points
                 .iter()
                 .map(|ip| crate::coord::IntroPointData {
@@ -984,11 +1165,11 @@ async fn intro_point_refresh_loop(
                 }
             }
 
-            // Update local state
-            let mut state = state.write().await;
-            state.own_intro_points = intro_points;
-        } else if new_count > 0 && !changed {
-            debug!("Intro points stable at {}", new_count);
+            // Update local state if changed
+            if changed {
+                let mut state = state.write().await;
+                state.own_intro_points = intro_points;
+            }
         } else if current_count > 0 && new_count == 0 {
             warn!("Intro points dropped to 0 (was {})", current_count);
             let mut state = state.write().await;

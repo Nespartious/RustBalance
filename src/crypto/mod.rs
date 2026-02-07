@@ -11,4 +11,4 @@ pub mod keys;
 
 pub use blinding::{blind_identity, blind_private_key, current_time_period, derive_subcredential};
 pub use descriptor::{decrypt_layer, DescriptorBuilder, DescriptorOutput};
-pub use keys::{load_identity_key, pubkey_from_onion_address, MasterIdentity};
+pub use keys::{load_identity_key, pubkey_from_onion_address, write_tor_key_files, MasterIdentity};

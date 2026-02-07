@@ -28,6 +28,9 @@ pub struct RuntimeState {
     /// This is set to true when we enter multi-node mode to prevent
     /// Tor from overwriting our HSPOST descriptors.
     pub tor_publish_disabled: bool,
+    /// This node's unique .onion address (from node.hidden_service_dir)
+    /// Different from master address - used for intro point sharing.
+    pub node_onion_address: Option<String>,
 }
 
 impl RuntimeState {
@@ -42,6 +45,7 @@ impl RuntimeState {
             hs_running: false,
             target_healthy: false,
             tor_publish_disabled: false,
+            node_onion_address: None,
         }
     }
 
