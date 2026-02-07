@@ -679,62 +679,17 @@ EOF
     # Build HTTPS flag string if needed
     local HTTPS_FLAG=""
     if [ "$USE_HTTPS" = true ]; then
-        HTTPS_FLAG=" \\\\
-  --https"
+        HTTPS_FLAG=" --https"
     fi
     if [ "$MASTER_ONION" != "PENDING_FIRST_RUN" ]; then
-        echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \\"
-        echo "  --join \\"
-        echo "  --target $TARGET_ONION \\"
-        echo "  --master-onion \"$MASTER_ONION\" \\"
-        echo "  --master-key \"$MASTER_KEY_B64\" \\"
-        echo "  --peer-endpoint \"$ENDPOINT\" \\"
-        echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
-        echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-        echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
-        if [ "$USE_HTTPS" = true ]; then
-            echo " \\"
-            echo "  --https"
-        else
-            echo ""
-        fi
-        echo -e "${NC}"
+        echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- --join --target $TARGET_ONION --master-onion \"$MASTER_ONION\" --master-key \"$MASTER_KEY_B64\" --peer-endpoint \"$ENDPOINT\" --peer-pubkey \"$WG_PUBLIC\" --cluster-token \"$CLUSTER_TOKEN_GENERATED\" --join-secret \"$JOIN_SECRET_GENERATED\"${HTTPS_FLAG}${NC}"
     else
-        echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- \\"
-        echo "  --join \\"
-        echo "  --target $TARGET_ONION \\"
-        echo "  --master-onion \"\$(sudo cat $CONFIG_DIR/master_onion.txt)\" \\"
-        echo "  --master-key \"$MASTER_KEY_B64\" \\"
-        echo "  --peer-endpoint \"$ENDPOINT\" \\"
-        echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
-        echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-        echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
-        if [ "$USE_HTTPS" = true ]; then
-            echo " \\"
-            echo "  --https"
-        else
-            echo ""
-        fi
-        echo -e "${NC}"
+        echo -e "${GREEN}curl -sSL https://raw.githubusercontent.com/Nespartious/RustBalance/main/testing/deploy.sh | sudo bash -s -- --join --target $TARGET_ONION --master-onion \"\$(sudo cat $CONFIG_DIR/master_onion.txt)\" --master-key \"$MASTER_KEY_B64\" --peer-endpoint \"$ENDPOINT\" --peer-pubkey \"$WG_PUBLIC\" --cluster-token \"$CLUSTER_TOKEN_GENERATED\" --join-secret \"$JOIN_SECRET_GENERATED\"${HTTPS_FLAG}${NC}"
     fi
     echo ""
     echo "Or if you already have the binary, run:"
     echo ""
-    echo -e "${GREEN}sudo ./deploy.sh --join \\"
-    echo "  --target $TARGET_ONION \\"
-    echo "  --master-onion \"$MASTER_ONION\" \\"
-    echo "  --master-key \"$MASTER_KEY_B64\" \\"
-    echo "  --peer-endpoint \"$ENDPOINT\" \\"
-    echo "  --peer-pubkey \"$WG_PUBLIC\" \\"
-    echo "  --cluster-token \"$CLUSTER_TOKEN_GENERATED\" \\"
-    echo -n "  --join-secret \"$JOIN_SECRET_GENERATED\""
-    if [ "$USE_HTTPS" = true ]; then
-        echo " \\"
-        echo "  --https"
-    else
-        echo ""
-    fi
-    echo -e "${NC}"
+    echo -e "${GREEN}sudo ./deploy.sh --join --target $TARGET_ONION --master-onion \"$MASTER_ONION\" --master-key \"$MASTER_KEY_B64\" --peer-endpoint \"$ENDPOINT\" --peer-pubkey \"$WG_PUBLIC\" --cluster-token \"$CLUSTER_TOKEN_GENERATED\" --join-secret \"$JOIN_SECRET_GENERATED\"${HTTPS_FLAG}${NC}"
     echo ""
     echo -e "${YELLOW}IMPORTANT: The service will auto-start after deployment.${NC}"
     echo "The script will wait for the hidden service to become reachable."
