@@ -22,18 +22,35 @@ A pre-commit hook is installed to enforce this, but always verify before committ
 
 | Branch | Purpose | Protected | Merge Via |
 |--------|---------|-----------|-----------|
-| `main` | **Stable, deployable** — last known working version. Never commit directly. | ✅ | PR from `dev` only |
-| `dev` | **Active development** — all Phase work happens here. Must pass CI before merging to main. | ✅ | PR from feature branches or direct commits |
-| `feature/*` | **Optional** — for large multi-commit tasks, branch from `dev`, PR back to `dev`. | ❌ | PR to `dev` |
+| `main` | **Production release** — last known working version. Never commit directly. | ✅ | Merge from `dev` only, after full test pass |
+| `dev` | **Integration staging** — holds tested, confirmed-working code only. Never commit untested code. | ✅ | Merge from `feature/*` branches only, after VM deployment tests pass |
+| `feature/*` | **All active work** — every change starts here. Branch from `dev`, test on VMs, merge back to `dev`. | ❌ | Merge to `dev` after passing all gates |
 
 ### Workflow Rules
 
-1. **NEVER commit directly to `main`** — All changes reach main through a PR from `dev`.
-2. **All work happens on `dev`** — Small tasks can be committed directly to `dev`. Larger tasks (multi-file, risky) should use a `feature/*` branch with a PR to `dev`.
-3. **CI must pass before merge** — Every PR to `dev` or `main` must pass: `cargo check`, `cargo clippy`, `cargo test`, `cargo fmt --check`.
-4. **Test before declaring done** — Each task in a Phase document must be tested (compile + runtime behavior) before marking complete.
-5. **Atomic commits** — One logical change per commit. Don't mix refactors with features. Use conventional commit prefixes: `fix:`, `feat:`, `refactor:`, `docs:`, `chore:`, `test:`.
-6. **PR to main = release** — When `dev` is stable and tested (all Phase tasks for the sprint are complete), open a PR to `main`. This is a release checkpoint.
+1. **NEVER commit directly to `main`** — All changes reach main through a merge from `dev`.
+2. **NEVER commit directly to `dev`** — All code changes must go through a `feature/*` branch first. The only exceptions are documentation-only changes (README, copilot-instructions, etc.) that don't affect runtime behavior.
+3. **`dev` holds only tested, confirmed-working code** — Before merging any feature branch into `dev`, the code must be:
+   - Compiled successfully (`cargo check`, `cargo clippy`, `cargo fmt`)
+   - Deployed to test VMs from the feature branch
+   - Verified working via `testing/verify_deployment.ps1` on both VMs
+   - Load balance tested via `testing/load_balance_test.ps1`
+4. **Feature branch → dev gate** (all must pass before merge to `dev`):
+   - [ ] `cargo check` passes
+   - [ ] `cargo clippy -- -D warnings` passes (zero warnings)
+   - [ ] `cargo test` passes
+   - [ ] `cargo fmt --check` passes
+   - [ ] Deploy to test VMs from feature branch: `REPO_BRANCH=feature/xxx curl ... | sudo bash`
+   - [ ] Run `testing/verify_deployment.ps1` — both VMs healthy, peers connected, no errors
+   - [ ] Run `testing/load_balance_test.ps1` — load balancing confirmed across nodes
+5. **Dev → main gate** (all must pass before merge to `main`):
+   - [ ] All feature branch → dev gates passed
+   - [ ] Fresh VM reset and redeploy from `dev` branch
+   - [ ] `testing/verify_deployment.ps1` passes on fresh deploy
+   - [ ] `testing/load_balance_test.ps1` confirms load balancing
+   - [ ] No regressions in any existing functionality
+6. **Atomic commits** — One logical change per commit. Don't mix refactors with features. Use conventional commit prefixes: `fix:`, `feat:`, `refactor:`, `docs:`, `chore:`, `test:`.
+7. **Test scripts are mandatory** — After every deployment, run `testing/verify_deployment.ps1` before considering it "working". The load balance test (`testing/load_balance_test.ps1`) must be run before any merge to `dev` or `main`.
 
 ### Deployment Branch
 
@@ -46,12 +63,31 @@ A pre-commit hook is installed to enforce this, but always verify before committ
 
 ### PR Checklist (enforce on every PR)
 
+**Feature → Dev:**
 - [ ] `cargo check` passes
 - [ ] `cargo clippy -- -D warnings` passes (zero warnings)
 - [ ] `cargo test` passes
 - [ ] `cargo fmt --check` passes
 - [ ] Commit messages use conventional format
-- [ ] Related Phase document task is referenced in PR description
+- [ ] Related Phase document task is referenced
+- [ ] Deployed to test VMs from feature branch
+- [ ] `testing/verify_deployment.ps1` passes on both VMs
+- [ ] `testing/load_balance_test.ps1` confirms load balancing
+
+**Dev → Main (release):**
+- [ ] All of the above, plus:
+- [ ] Fresh VM reset and redeploy from `dev` branch
+- [ ] Both verification scripts pass on fresh deploy
+- [ ] No regressions in existing functionality
+
+### Test Scripts
+
+All test scripts live in `testing/` and are run from the Windows development machine.
+
+| Script | Purpose | When to Run |
+|--------|---------|-------------|
+| `testing/verify_deployment.ps1` | Checks both VMs: service status, uptime, WG peers, errors, peer health, publishing status | After every deployment |
+| `testing/load_balance_test.ps1` | Sends requests through Tor to master .onion, verifies traffic hits multiple nodes | Before every merge to `dev` or `main` |
 
 ---
 
