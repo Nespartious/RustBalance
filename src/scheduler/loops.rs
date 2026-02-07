@@ -48,12 +48,11 @@ pub async fn run(
         "Node hidden service directory: {}",
         config.node.hidden_service_dir
     );
-    
+
     // Load master identity and write its keys to the HS directory
-    let master_identity = crate::crypto::load_identity_key(
-        std::path::Path::new(&config.master.identity_key_path)
-    )?;
-    
+    let master_identity =
+        crate::crypto::load_identity_key(std::path::Path::new(&config.master.identity_key_path))?;
+
     info!(
         "Writing master key to HS directory: {}",
         config.node.hidden_service_dir
@@ -82,8 +81,7 @@ pub async fn run(
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // Verify hostname matches master address
-        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
-            .await
+        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir).await
         {
             Ok(hostname) => {
                 info!("Tor HS address: {}", hostname);
@@ -194,8 +192,7 @@ pub async fn run(
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // Verify hostname matches master address
-        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir)
-            .await
+        match crate::balance::onion_service::read_hs_hostname(&config.node.hidden_service_dir).await
         {
             Ok(hostname) => {
                 info!("Tor HS address: {}", hostname);
@@ -618,20 +615,19 @@ async fn publish_loop(
     let mut ticker = interval(Duration::from_secs(config.publish.refresh_interval_secs));
     // Tick immediately on first iteration (don't wait for full interval)
     ticker.tick().await;
-    
+
     info!(
         "Publish loop starting, interval: {} secs",
         config.publish.refresh_interval_secs
     );
 
-    // Max intro points per descriptor (Tor spec limit)
-    let max_intro_points = 20;
+    // Max intro points per descriptor (from config, Tor spec max is 20)
+    let max_intro_points = config.publish.max_intro_points;
 
     // Track whether Tor's auto-publish is disabled (for multi-node mode)
     let mut auto_publish_disabled = false;
 
     loop {
-
         // Auto-detect mode: check if we have active peers
         let (has_active_peers, alive_count) = {
             let coord = coordinator.read().await;
@@ -670,6 +666,50 @@ async fn publish_loop(
             }
         }
 
+        // CRITICAL: ALL nodes must manage Tor auto-publish based on mode.
+        // In multi-node mode, Tor's auto-publish must be disabled on EVERY node,
+        // not just the publisher. Without this, non-publisher nodes' Tor instances
+        // continuously auto-publish their own descriptor (with only their intro
+        // points), racing against and overwriting the publisher's merged descriptor
+        // on HSDirs. This causes nearly all client traffic to hit only one node.
+        if has_active_peers && !auto_publish_disabled {
+            info!("Multi-node mode: disabling Tor auto-publish on this node");
+            match crate::tor::control::TorController::connect(&config.tor).await {
+                Ok(mut tor) => {
+                    if let Err(e) = tor.set_publish_descriptors(false).await {
+                        warn!("Failed to disable Tor auto-publish: {}", e);
+                    } else {
+                        auto_publish_disabled = true;
+                        info!(
+                            "Tor auto-publish disabled — only HSPOST descriptors will reach HSDirs"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to connect to Tor to disable auto-publish: {}", e);
+                },
+            }
+        }
+
+        // When transitioning back to single-node mode (all peers lost),
+        // re-enable Tor auto-publish so the node can self-publish.
+        if !has_active_peers && auto_publish_disabled {
+            info!("Returning to single-node mode: re-enabling Tor auto-publish");
+            match crate::tor::control::TorController::connect(&config.tor).await {
+                Ok(mut tor) => {
+                    if let Err(e) = tor.set_publish_descriptors(true).await {
+                        warn!("Failed to re-enable Tor auto-publish: {}", e);
+                    } else {
+                        auto_publish_disabled = false;
+                        info!("Tor auto-publish re-enabled for single-node mode");
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to connect to Tor to re-enable auto-publish: {}", e);
+                },
+            }
+        }
+
         // Check if we're publisher
         let is_publisher = {
             let coord = coordinator.read().await;
@@ -701,24 +741,6 @@ async fn publish_loop(
             // transition when peers join. Using higher revision counter ensures
             // our descriptor takes precedence.
             info!("Single-node mode: publishing descriptor for master address via HSPOST");
-
-            // Re-enable Tor auto-publish if it was previously disabled (transition from multi → single)
-            if auto_publish_disabled {
-                info!("Single-node mode: re-enabling Tor auto-publish");
-                match crate::tor::control::TorController::connect(&config.tor).await {
-                    Ok(mut tor) => {
-                        if let Err(e) = tor.set_publish_descriptors(true).await {
-                            warn!("Failed to re-enable Tor auto-publish: {}", e);
-                        } else {
-                            auto_publish_disabled = false;
-                            info!("Tor auto-publish re-enabled for single-node mode");
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to connect to Tor to re-enable auto-publish: {}", e);
-                    },
-                }
-            }
 
             // Get our own intro points
             let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
@@ -760,29 +782,6 @@ async fn publish_loop(
             );
         } else {
             // Multi-node mode with intro points: merge and publish
-
-            // CRITICAL: Disable Tor's auto-publishing in multi-node mode.
-            // Tor's service subsystem runs upload_descriptor_to_hsdir() every second,
-            // which uses OPE-encrypted revision counters that monotonically increase.
-            // This constantly overwrites our HSPOST descriptor on HSDirs.
-            // PublishHidServDescriptors=0 only stops descriptor UPLOADS to HSDirs;
-            // intro point circuits continue to be maintained normally.
-            if !auto_publish_disabled {
-                info!("Multi-node mode: disabling Tor auto-publish to prevent HSPOST race");
-                match crate::tor::control::TorController::connect(&config.tor).await {
-                    Ok(mut tor) => {
-                        if let Err(e) = tor.set_publish_descriptors(false).await {
-                            warn!("Failed to disable Tor auto-publish: {}", e);
-                        } else {
-                            auto_publish_disabled = true;
-                            info!("Tor auto-publish disabled successfully");
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to connect to Tor to disable auto-publish: {}", e);
-                    },
-                }
-            }
 
             // 1. Collect own intro points
             let own_intro_points: Vec<crate::tor::IntroductionPoint> = {
@@ -828,12 +827,19 @@ async fn publish_loop(
             }
             info!(
                 "Multi-node mode: merging {} own + {} peer intro points (heartbeat reported {})",
-                own_intro_points.len(), actual_peer_count, peer_intro_count
+                own_intro_points.len(),
+                actual_peer_count,
+                peer_intro_count
             );
 
-            // 3. Merge intro points, capping at max
+            // 3. Merge intro points with fair shuffling
+            // Shuffle before truncation ensures fair distribution across nodes
+            // rather than always favoring the publisher's own intro points.
             let mut merged: Vec<crate::tor::IntroductionPoint> = own_intro_points;
             merged.extend(peer_intro_points);
+
+            use rand::seq::SliceRandom;
+            merged.shuffle(&mut rand::thread_rng());
 
             if merged.len() > max_intro_points {
                 info!(
@@ -866,7 +872,7 @@ async fn publish_loop(
                 },
             }
         }
-        
+
         // Wait for next publish interval
         ticker.tick().await;
     }
@@ -1044,9 +1050,9 @@ async fn intro_point_refresh_loop(
 
     // Load master identity key for descriptor decryption
     // This is the same key that Tor is using (we wrote it to HS dir at startup)
-    let node_key_path = std::path::Path::new(&config.node.hidden_service_dir)
-        .join("hs_ed25519_secret_key");
-    
+    let node_key_path =
+        std::path::Path::new(&config.node.hidden_service_dir).join("hs_ed25519_secret_key");
+
     let master_identity = match crate::crypto::load_identity_key(&node_key_path) {
         Ok(id) => id,
         Err(e) => {
@@ -1073,12 +1079,9 @@ async fn intro_point_refresh_loop(
             state.node_onion_address.clone()
         };
 
-        let addr = match node_onion_address {
-            Some(addr) => addr,
-            None => {
-                debug!("Onion address not yet available, waiting...");
-                continue;
-            },
+        let Some(addr) = node_onion_address else {
+            debug!("Onion address not yet available, waiting...");
+            continue;
         };
 
         // Connect to Tor control port
@@ -1095,7 +1098,10 @@ async fn intro_point_refresh_loop(
         let descriptor_raw = match tor.get_own_hs_descriptor(&addr).await {
             Ok(Some(desc)) => desc,
             Ok(None) => {
-                info!("No descriptor available yet for {} - waiting for Tor to publish.", addr);
+                info!(
+                    "No descriptor available yet for {} - waiting for Tor to publish.",
+                    addr
+                );
                 continue;
             },
             Err(e) => {
