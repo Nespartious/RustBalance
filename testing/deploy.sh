@@ -35,7 +35,7 @@
 set -e
 
 REPO_URL="https://github.com/Nespartious/RustBalance.git"
-REPO_BRANCH="feature/separate-node-addresses"  # Branch to clone (testing feature branch)
+REPO_BRANCH="${REPO_BRANCH:-main}"  # Default to main; override with: REPO_BRANCH=dev sudo bash deploy.sh
 INSTALL_DIR="$HOME/rustbalance"
 CONFIG_DIR="/etc/rustbalance"
 # DEPRECATED: Legacy HS dir path (kept for backward compatibility)
