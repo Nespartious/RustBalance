@@ -129,9 +129,10 @@ impl TorController {
             tracing::debug!("Waiting to read line {}...", total_lines_read + 1);
 
             // Add a timeout to prevent hanging forever
+            // Use 30 seconds to accommodate large responses (e.g. consensus ~5MB)
             let read_future = reader.read_line(&mut line);
             let bytes_read =
-                match tokio::time::timeout(std::time::Duration::from_secs(10), read_future).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), read_future).await {
                     Ok(result) => result?,
                     Err(_) => {
                         tracing::warn!(
@@ -233,10 +234,15 @@ impl TorController {
         hs_address: &str,
         servers: &[String],
     ) -> Result<()> {
-        let server_list = if servers.is_empty() {
+        // Build SERVER= arguments: one SERVER= per HSDir fingerprint
+        let server_args = if servers.is_empty() {
             String::new()
         } else {
-            format!(" SERVER={}", servers.join(","))
+            use std::fmt::Write;
+            servers.iter().fold(String::new(), |mut acc, s| {
+                let _ = write!(acc, " SERVER={}", s);
+                acc
+            })
         };
 
         // Strip .onion suffix if present for HSADDRESS
@@ -250,7 +256,7 @@ impl TorController {
 
         let cmd = format!(
             "+HSPOST{} HSADDRESS={}\r\n{}\r\n.\r\n",
-            server_list, addr, descriptor_trimmed
+            server_args, addr, descriptor_trimmed
         );
 
         tracing::info!(

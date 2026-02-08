@@ -43,6 +43,25 @@ impl Publisher {
         tor: &mut TorController,
         intro_points: Vec<IntroductionPoint>,
     ) -> Result<()> {
+        self.publish_to_hsdirs(tor, intro_points, None).await
+    }
+
+    /// Publish a descriptor to specific HSDirs (targeted HSPOST).
+    ///
+    /// If `hsdirs` is `Some`, uploads to each specified HSDir using
+    /// `HSPOST SERVER=<fingerprint>`. This ensures the merged descriptor
+    /// reaches ALL responsible HSDirs for both SRV indices.
+    ///
+    /// If `hsdirs` is `None`, falls back to default HSPOST (Tor picks HSDirs).
+    ///
+    /// Each entry in the outer Vec corresponds to a time period (first, second).
+    /// Each inner Vec is the list of HSDir fingerprints for that period.
+    pub async fn publish_to_hsdirs(
+        &mut self,
+        tor: &mut TorController,
+        intro_points: Vec<IntroductionPoint>,
+        hsdirs: Option<&[Vec<String>]>,
+    ) -> Result<()> {
         if intro_points.is_empty() {
             warn!("No introduction points to publish");
             return Ok(());
@@ -81,17 +100,37 @@ impl Publisher {
                 output.descriptor.len()
             );
 
+            // Determine which servers to upload to
+            let servers: Vec<String> = if let Some(hsdir_lists) = hsdirs {
+                if i < hsdir_lists.len() {
+                    hsdir_lists[i].clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let server_count = servers.len();
+
             // Upload via Tor control port
             let onion_addr = self.identity.onion_address();
-            info!(
-                "Uploading {} period descriptor via HSPOST for {}...",
-                period_label, onion_addr
-            );
-            tor.upload_hs_descriptor(&output.descriptor, &onion_addr, &[])
+            if server_count > 0 {
+                info!(
+                    "Uploading {} period descriptor via targeted HSPOST to {} HSDirs for {}",
+                    period_label, server_count, onion_addr
+                );
+            } else {
+                info!(
+                    "Uploading {} period descriptor via HSPOST (default routing) for {}",
+                    period_label, onion_addr
+                );
+            }
+            tor.upload_hs_descriptor(&output.descriptor, &onion_addr, &servers)
                 .await?;
             info!(
-                "HSPOST for {} period accepted (rev {})",
-                period_label, self.revision_counter
+                "HSPOST for {} period accepted (rev {}, {} HSDirs targeted)",
+                period_label, self.revision_counter, server_count
             );
         }
 
@@ -127,5 +166,60 @@ impl Publisher {
     /// Get the onion address for this publisher
     pub fn onion_address(&self) -> String {
         self.identity.onion_address()
+    }
+
+    /// Get the master identity (for computing blinded keys for HSDir lookup)
+    pub fn identity(&self) -> &MasterIdentity {
+        &self.identity
+    }
+
+    /// Publish a single descriptor for one time period to specific HSDirs.
+    ///
+    /// This is used in multi-node mode where we compute the responsible
+    /// HSDirs from the consensus hash ring and target each one individually.
+    pub async fn publish_single_period(
+        &mut self,
+        tor: &mut TorController,
+        intro_points: &[IntroductionPoint],
+        time_period: u64,
+        hsdirs: &[String],
+        label: &str,
+    ) -> Result<()> {
+        if intro_points.is_empty() {
+            warn!("No introduction points to publish for {} period", label);
+            return Ok(());
+        }
+
+        self.revision_counter += 1;
+        info!(
+            "Building {} descriptor (tp={}) with revision counter {}, targeting {} HSDirs",
+            label,
+            time_period,
+            self.revision_counter,
+            hsdirs.len()
+        );
+
+        let builder = DescriptorBuilder::new(&self.identity, self.revision_counter);
+        let output = builder.build_for_period(intro_points, time_period)?;
+
+        let onion_addr = self.identity.onion_address();
+        info!(
+            "Uploading {} descriptor via targeted HSPOST to {} HSDirs for {}",
+            label,
+            hsdirs.len(),
+            onion_addr,
+        );
+
+        tor.upload_hs_descriptor(&output.descriptor, &onion_addr, hsdirs)
+            .await?;
+
+        info!(
+            "HSPOST for {} period accepted (rev {}, {} HSDirs)",
+            label,
+            self.revision_counter,
+            hsdirs.len()
+        );
+
+        Ok(())
     }
 }

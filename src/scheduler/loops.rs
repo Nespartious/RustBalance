@@ -721,21 +721,18 @@ async fn publish_loop(
             coord.election().is_publisher()
         };
 
-        // CRITICAL: Auto-publish management depends on BOTH mode AND role.
+        // CRITICAL: Auto-publish management for multi-node mode.
         //
-        // NON-PUBLISHER nodes: MUST disable auto-publish. Without this, their Tor
-        // instances auto-publish descriptors with only their own intro points,
-        // racing against the publisher's merged descriptor on HSDirs.
+        // ALL nodes (including the publisher) MUST disable auto-publish.
+        // Without this, Tor auto-publishes a descriptor containing only THIS
+        // node's intro points to ALL HSDirs, overwriting our merged descriptor.
         //
-        // PUBLISHER node: MUST KEEP auto-publish ENABLED. Tor's HSPOST command
-        // only uploads to the first HSDir index for the current time period.
-        // This means HSPOST misses ~half the HSDirs and completely misses HSDirs
-        // for the secondary time period. Tor's auto-publish covers ALL HSDirs
-        // for ALL time periods and indices. Our HSPOST (with higher revision
-        // counter) overrides on the HSDirs it reaches, and Tor's auto-published
-        // descriptor acts as a fallback on the rest.
-        if has_active_peers && !is_publisher && !auto_publish_disabled {
-            info!("Non-publisher multi-node mode: disabling Tor auto-publish on this node");
+        // Instead, the publisher computes ALL responsible HSDirs from the Tor
+        // consensus hash ring and uploads the merged descriptor to each one
+        // individually using HSPOST SERVER=<fingerprint>. This covers both
+        // SRV indices and both time periods — something plain HSPOST cannot do.
+        if has_active_peers && !auto_publish_disabled {
+            info!("Multi-node mode: disabling Tor auto-publish on this node");
             match crate::tor::control::TorController::connect(&config.tor).await {
                 Ok(mut tor) => {
                     if let Err(e) = tor.set_publish_descriptors(false).await {
@@ -743,32 +740,12 @@ async fn publish_loop(
                     } else {
                         auto_publish_disabled = true;
                         info!(
-                            "Tor auto-publish disabled on non-publisher — only HSPOST descriptors will reach HSDirs"
+                            "Tor auto-publish disabled — publisher will use targeted HSPOST SERVER= to all responsible HSDirs"
                         );
                     }
                 },
                 Err(e) => {
                     warn!("Failed to connect to Tor to disable auto-publish: {}", e);
-                },
-            }
-        }
-
-        // Publisher in multi-node mode: re-enable auto-publish if it was disabled.
-        // This handles the case where a node was non-publisher (auto-publish off)
-        // and then won the election, or where the startup safety-net disabled it.
-        if has_active_peers && is_publisher && auto_publish_disabled {
-            info!("Publisher node: re-enabling Tor auto-publish (HSPOST fallback for full HSDir coverage)");
-            match crate::tor::control::TorController::connect(&config.tor).await {
-                Ok(mut tor) => {
-                    if let Err(e) = tor.set_publish_descriptors(true).await {
-                        warn!("Failed to re-enable Tor auto-publish for publisher: {}", e);
-                    } else {
-                        auto_publish_disabled = false;
-                        info!("Tor auto-publish re-enabled on publisher — provides full HSDir coverage");
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to connect to Tor to re-enable auto-publish: {}", e);
                 },
             }
         }
@@ -931,13 +908,105 @@ async fn publish_loop(
                 merged.len()
             );
 
-            // 4. Connect to Tor and publish via HSPOST
+            // 4. Connect to Tor, fetch consensus, compute HSDirs, and publish
             match crate::tor::control::TorController::connect(&config.tor).await {
                 Ok(mut tor) => {
-                    if let Err(e) = publisher.publish(&mut tor, merged).await {
-                        warn!("Failed to publish merged descriptor: {}", e);
-                    } else {
-                        info!("Successfully published merged descriptor via HSPOST");
+                    // Fetch consensus to compute responsible HSDirs
+                    match crate::tor::consensus::fetch_consensus(&mut tor).await {
+                        Ok(consensus) => {
+                            let current_tp = crate::crypto::blinding::current_time_period();
+                            let between_tp_and_srv =
+                                crate::crypto::blinding::in_period_between_tp_and_srv();
+
+                            // Compute responsible HSDirs for BOTH descriptors.
+                            // "First descriptor" = uses previous SRV
+                            // "Second descriptor" = uses current SRV
+                            // Each has its own time period and hash ring.
+                            let pubkey = publisher.identity().public_key();
+
+                            let (_, tp_first_desc) = crate::tor::consensus::get_srv_and_time_period(
+                                &consensus, true, current_tp,
+                            );
+                            let blinded_first = crate::crypto::blinding::blind_identity(
+                                pubkey,
+                                tp_first_desc * 86400,
+                                None,
+                            );
+                            let hsdirs_first = crate::tor::consensus::compute_responsible_hsdirs(
+                                &consensus,
+                                &blinded_first,
+                                true,
+                                current_tp,
+                            );
+
+                            let (_, tp_second_desc) =
+                                crate::tor::consensus::get_srv_and_time_period(
+                                    &consensus, false, current_tp,
+                                );
+                            let blinded_second = crate::crypto::blinding::blind_identity(
+                                pubkey,
+                                tp_second_desc * 86400,
+                                None,
+                            );
+                            let hsdirs_second = crate::tor::consensus::compute_responsible_hsdirs(
+                                &consensus,
+                                &blinded_second,
+                                false,
+                                current_tp,
+                            );
+
+                            info!(
+                                "Computed responsible HSDirs: first desc ({} HSDirs, tp={}), second desc ({} HSDirs, tp={}), phase={}",
+                                hsdirs_first.len(),
+                                tp_first_desc,
+                                hsdirs_second.len(),
+                                tp_second_desc,
+                                if between_tp_and_srv { "TP→SRV" } else { "SRV→TP" },
+                            );
+
+                            // Publish each descriptor to its correct HSDirs
+                            let label_first = format!("first (prev-SRV, tp={})", tp_first_desc);
+                            if let Err(e) = publisher
+                                .publish_single_period(
+                                    &mut tor,
+                                    &merged,
+                                    tp_first_desc,
+                                    &hsdirs_first,
+                                    &label_first,
+                                )
+                                .await
+                            {
+                                warn!("Failed to publish first descriptor: {}", e);
+                            }
+
+                            let label_second = format!("second (curr-SRV, tp={})", tp_second_desc);
+                            if let Err(e) = publisher
+                                .publish_single_period(
+                                    &mut tor,
+                                    &merged,
+                                    tp_second_desc,
+                                    &hsdirs_second,
+                                    &label_second,
+                                )
+                                .await
+                            {
+                                warn!("Failed to publish second descriptor: {}", e);
+                            }
+
+                            info!("Successfully published merged descriptors to targeted HSDirs");
+                        },
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch consensus, falling back to default HSPOST: {}",
+                                e
+                            );
+                            // Fallback: publish without targeting (better than nothing)
+                            if let Err(e) = publisher.publish(&mut tor, merged).await {
+                                warn!("Failed to publish merged descriptor: {}", e);
+                            } else {
+                                info!("Published merged descriptor via default HSPOST (fallback)");
+                            }
+                        },
                     }
                 },
                 Err(e) => {

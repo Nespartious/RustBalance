@@ -3,6 +3,7 @@
 //! Handles Tor ControlPort communication, descriptor fetching,
 //! and HSDir publishing. Tor is treated as a black box.
 
+pub mod consensus;
 pub mod control;
 pub mod descriptors;
 pub mod hsdir;
