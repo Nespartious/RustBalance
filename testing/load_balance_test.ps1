@@ -169,15 +169,18 @@ for ($i = 1; $i -le $testCount; $i++) {
     try {
         $result = curl.exe --socks5-hostname "${randomUser}:pass@${torProxy}" `
             "http://${masterOnion}/" `
-            -s -o NUL -w "%{http_code}|%{time_total}" `
+            -s -o NUL -w "%{http_code}|%{time_total}|%{exitcode}" `
             --max-time $TimeoutSeconds 2>&1
         
         $parts = $result -split '\|'
         $httpCode = $parts[0]
         $duration = if ($parts.Count -gt 1) { $parts[1] } else { "?" }
+        $curlExit = if ($parts.Count -gt 2) { $parts[2] } else { "" }
         
-        # Any HTTP response means a node handled it (200, 301, 302 are all valid)
-        if ($httpCode -match '^\d{3}$') {
+        # HTTP 000 means no HTTP response was received - this is a connection failure
+        # (SOCKS5 error, timeout, or unreachable host), NOT a successful connection.
+        # Only real HTTP codes (1xx-5xx) indicate a node actually handled the request.
+        if ($httpCode -match '^[1-5]\d{2}$') {
             $successes++
             $results += $httpCode
             if ($httpCode -eq "200") {
@@ -185,6 +188,10 @@ for ($i = 1; $i -le $testCount; $i++) {
             } else {
                 Write-Host "Reached node (HTTP $httpCode, ${duration}s)" -ForegroundColor Yellow
             }
+        } elseif ($httpCode -eq "000") {
+            $failures++
+            $results += "CONN_FAIL"
+            Write-Host "CONNECTION FAILED (SOCKS/Tor error, ${duration}s)" -ForegroundColor Red
         } else {
             $failures++
             $results += "FAIL"
@@ -222,8 +229,8 @@ if ($CheckLogs -or ($successes -gt 0)) {
     # Give a moment for logs to flush
     Start-Sleep -Seconds 2
     
-    $vm1Sessions = ssh -i $sshKey hlu1@192.168.40.144 "journalctl -u rustbalance --since '10 min ago' --no-pager 2>/dev/null | grep -c 'Session #'" 2>$null
-    $vm2Sessions = ssh -i $sshKey hlu1@192.168.40.145 "journalctl -u rustbalance --since '10 min ago' --no-pager 2>/dev/null | grep -c 'Session #'" 2>$null
+    $vm1Sessions = ssh -i $sshKey hlu1@192.168.40.144 "echo pass | sudo -S journalctl -u rustbalance --since '10 min ago' --no-pager 2>/dev/null | grep -c 'Session #'" 2>$null
+    $vm2Sessions = ssh -i $sshKey hlu1@192.168.40.145 "echo pass | sudo -S journalctl -u rustbalance --since '10 min ago' --no-pager 2>/dev/null | grep -c 'Session #'" 2>$null
     
     $vm1Count = if ($vm1Sessions -match '^\d+$') { [int]$vm1Sessions } else { 0 }
     $vm2Count = if ($vm2Sessions -match '^\d+$') { [int]$vm2Sessions } else { 0 }
