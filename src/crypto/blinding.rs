@@ -219,13 +219,49 @@ pub fn current_time_period() -> u64 {
     offset_minutes / TIME_PERIOD_LENGTH_MINUTES
 }
 
-/// Get both the current and next time period numbers
+/// Determine if we are in the phase between a TP boundary and the next SRV
+/// boundary. This mirrors Tor's `hs_in_period_between_tp_and_srv()`.
 ///
-/// Per rend-spec-v3 §2.2.1: "A service MUST generate and upload descriptors
-/// for the current and the following time period."
-pub fn current_and_next_time_periods() -> (u64, u64) {
+/// Timeline (standard network):
+///   00:00 UTC  = SRV boundary (shared random value changes)
+///   12:00 UTC  = TP boundary  (time period number increments)
+///
+///   [00:00, 12:00) → between SRV and TP → returns false
+///   [12:00, 00:00) → between TP and SRV → returns true
+pub fn in_period_between_tp_and_srv() -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs();
+
+    // SRV protocol run duration = 24 hours = 86400 seconds
+    // Phase duration = SRV run / 2 = 12 hours = 43200 seconds
+    // SRV boundary at 00:00 UTC, TP boundary at 12:00 UTC
+    // Between 12:00 and 00:00 UTC → between TP and SRV
+    let seconds_into_day = now % 86400;
+    seconds_into_day >= 43200 // 43200 seconds = 12 hours
+}
+
+/// Get the two time period numbers to publish descriptors for.
+///
+/// Tor publishes descriptors for two time periods simultaneously.
+/// Which pair depends on where we are in the TP/SRV cycle:
+///
+///   Between SRV and TP (00:00–12:00 UTC): publish for (current, next)
+///   Between TP and SRV (12:00–00:00 UTC): publish for (current, previous)
+///
+/// This ensures clients can always find descriptors regardless of which
+/// blinded key / HSDir index they use for their lookup.
+pub fn descriptor_time_periods() -> (u64, u64) {
     let tp = current_time_period();
-    (tp, tp + 1)
+    if in_period_between_tp_and_srv() {
+        // After TP boundary, before next SRV: current + previous
+        (tp, tp.saturating_sub(1))
+    } else {
+        // After SRV boundary, before next TP: current + next
+        (tp, tp + 1)
+    }
 }
 
 /// Calculate time until next period boundary

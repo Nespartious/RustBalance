@@ -2,7 +2,7 @@
 //!
 //! Builds and uploads the master descriptor to HSDirs.
 
-use crate::crypto::blinding::current_and_next_time_periods;
+use crate::crypto::blinding::descriptor_time_periods;
 use crate::crypto::{DescriptorBuilder, MasterIdentity};
 use crate::tor::{IntroductionPoint, TorController};
 use anyhow::Result;
@@ -54,13 +54,14 @@ impl Publisher {
         );
 
         // Build and upload descriptors for BOTH time periods
-        // Per rend-spec-v3 §2.2.1: "A service MUST generate and upload descriptors
-        // for the current and the following time period."
-        let (tp_current, tp_next) = current_and_next_time_periods();
-        let time_periods = [tp_current, tp_next];
+        // Per Tor's HS protocol, which pair depends on the TP/SRV phase:
+        //   Between SRV and TP (00:00–12:00 UTC): current + next
+        //   Between TP and SRV (12:00–00:00 UTC): current + previous
+        let (tp_first, tp_second) = descriptor_time_periods();
+        let time_periods = [tp_first, tp_second];
 
         for (i, &tp) in time_periods.iter().enumerate() {
-            let period_label = if i == 0 { "current" } else { "next" };
+            let period_label = if i == 0 { "primary" } else { "secondary" };
 
             // Each time period needs its own revision counter and signing key
             self.revision_counter += 1;
@@ -98,7 +99,7 @@ impl Publisher {
 
         info!(
             "Descriptors published for both time periods (tp {} and {}, latest rev {})",
-            tp_current, tp_next, self.revision_counter
+            tp_first, tp_second, self.revision_counter
         );
 
         Ok(())
