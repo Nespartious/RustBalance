@@ -101,6 +101,37 @@ journalctl -u rustbalance --no-pager 2>/dev/null | grep -iE "introduction points
 echo "===RECENT_ERRORS==="
 journalctl -u rustbalance --no-pager -n 500 2>/dev/null | grep -iE "error" | tail -5
 
+# OB config presence and ControlPort GETCONF check
+echo "===OB_CONFIG==="
+HS_DIR="/var/lib/tor/rustbalance_node_hs"
+if [ -f "$HS_DIR/ob_config" ]; then echo "present"; sed -n '1,5p' "$HS_DIR/ob_config"; else echo "missing"; fi
+
+echo "===GETCONF_OBINSTANCE==="
+python3 - <<'PY'
+import socket, time, binascii
+try:
+    cookie = binascii.hexlify(open('/run/tor/control.authcookie','rb').read()).decode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(('127.0.0.1', 9051))
+    def send(cmd):
+        s.sendall((cmd + '\r\n').encode())
+        time.sleep(0.3)
+        data = b''
+        while True:
+            try:
+                s.settimeout(1.0)
+                chunk = s.recv(65536)
+                if not chunk: break
+                data += chunk
+            except: break
+        return data.decode(errors='replace')
+    print(send('AUTHENTICATE ' + cookie).strip().splitlines()[-1])
+    print(send('GETCONF HiddenServiceOnionbalanceInstance').strip())
+    s.close()
+except Exception as e:
+    print('ERROR:'+str(e))
+PY
+
 echo "===END==="
 ' 2>/dev/null
 "@
@@ -126,7 +157,9 @@ echo "===END==="
     $publishStatus = Get-Section $output "PUBLISH_STATUS" "ELECTION"
     $election      = Get-Section $output "ELECTION" "INTRO_POINTS"
     $introPoints   = Get-Section $output "INTRO_POINTS" "RECENT_ERRORS"
-    $recentErrors  = Get-Section $output "RECENT_ERRORS" "END"
+    $recentErrors  = Get-Section $output "RECENT_ERRORS" "OB_CONFIG"
+    $obConfig      = Get-Section $output "OB_CONFIG" "GETCONF_OBINSTANCE"
+    $getconfOb     = Get-Section $output "GETCONF_OBINSTANCE" "END"
 
     # --- Evaluate each check ---
 
@@ -249,6 +282,40 @@ echo "===END==="
         }
     }
 
+    # 11. ob_config file present
+    if ($obConfig) {
+        $firstLine = ($obConfig -split "`n" | Select-Object -First 1).Trim()
+        if ($firstLine -match "^present") {
+            # next non-empty line should contain MasterOnionAddress
+            $contentLine = ($obConfig -split "`n" | Where-Object { $_ -match 'MasterOnionAddress' } | Select-Object -First 1)
+            if ($contentLine -and $contentLine -match "MasterOnionAddress\s+\S+") {
+                Write-Check "ob_config" "present and contains MasterOnionAddress" "pass"
+            } else {
+                Write-Check "ob_config" "present but missing MasterOnionAddress" "warn"
+            }
+        } elseif ($firstLine -match "missing") {
+            Write-Check "ob_config" "missing from HS dir" "warn"
+        } else {
+            Write-Check "ob_config" "unknown state" "warn"
+        }
+    } else {
+        Write-Check "ob_config" "no data returned" "warn"
+    }
+
+    # 12. Tor GETCONF HiddenServiceOnionbalanceInstance
+    if ($getconfOb) {
+        $got = ($getconfOb -split "`n" | Where-Object { $_ -match 'HiddenServiceOnionbalanceInstance' } | Select-Object -First 1).Trim()
+        if ($got -match "HiddenServiceOnionbalanceInstance\s*=\s*1" -or $got -match "HiddenServiceOnionbalanceInstance\s*1") {
+            Write-Check "GETCONF HiddenServiceOnionbalanceInstance" "1" "pass"
+        } elseif ($got -match "ERROR:") {
+            Write-Check "GETCONF HiddenServiceOnionbalanceInstance" "control port error" "warn"
+        } else {
+            Write-Check "GETCONF HiddenServiceOnionbalanceInstance" "$got" "warn"
+        }
+    } else {
+        Write-Check "GETCONF HiddenServiceOnionbalanceInstance" "no response" "warn"
+    }
+
     # Detailed output
     if ($Detailed) {
         Write-Host ""
@@ -271,6 +338,21 @@ echo "===END==="
         if ($wgHandshakes -and $wgHandshakes -ne "none") {
             Write-Host "  WG handshakes:" -ForegroundColor $C_DIM
             $wgHandshakes -split "`n" | ForEach-Object {
+                if ($_.Trim()) { Write-Host "    $($_.Trim())" -ForegroundColor $C_DIM }
+            }
+        }
+
+        # OB config diagnostic
+        if ($obConfig) {
+            Write-Host "  ob_config:" -ForegroundColor $C_DIM
+            $obConfig -split "`n" | ForEach-Object {
+                if ($_.Trim()) { Write-Host "    $($_.Trim())" -ForegroundColor $C_DIM }
+            }
+        }
+
+        if ($getconfOb) {
+            Write-Host "  Tor GETCONF HiddenServiceOnionbalanceInstance:" -ForegroundColor $C_DIM
+            $getconfOb -split "`n" | ForEach-Object {
                 if ($_.Trim()) { Write-Host "    $($_.Trim())" -ForegroundColor $C_DIM }
             }
         }

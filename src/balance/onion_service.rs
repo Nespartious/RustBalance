@@ -162,7 +162,7 @@ impl OnionService {
         // Configure hidden service via SETCONF
         // This tells Tor to create a hidden service from the directory
         let setconf_cmd = format!(
-            "SETCONF HiddenServiceDir=\"{}\" HiddenServicePort=\"{} 127.0.0.1:{}\"\r\n",
+            "SETCONF HiddenServiceDir=\"{}\" HiddenServicePort=\"{} 127.0.0.1:{}\" HiddenServiceOnionbalanceInstance=1\r\n",
             hs_dir, virtual_port, self.local_port
         );
         info!(

@@ -498,6 +498,18 @@ pub fn write_tor_key_files(identity: &MasterIdentity, hs_dir: &std::path::Path) 
 
     tracing::info!("Wrote hostname {} to {:?}", onion_addr, hostname_path);
 
+    // === Write ob_config to enable OnionBalance instance mode ===
+    // This file must exist in the HiddenServiceDir before Tor is configured
+    // with HiddenServiceOnionbalanceInstance=1. It contains a single line:
+    // MasterOnionAddress <master.onion>
+    let ob_config_path = hs_dir.join("ob_config");
+    let ob_contents = format!("MasterOnionAddress {}\n", onion_addr);
+    fs::write(&ob_config_path, ob_contents.as_bytes())
+        .with_context(|| format!("Failed to write ob_config: {:?}", ob_config_path))?;
+    set_restrictive_permissions(&ob_config_path)?;
+    set_tor_ownership(&ob_config_path)?;
+    tracing::info!("Wrote ob_config to {:?}", ob_config_path);
+
     Ok(())
 }
 

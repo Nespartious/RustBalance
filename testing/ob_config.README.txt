@@ -1,0 +1,10 @@
+This file documents the use of ob_config for OnionBalance instance mode.
+
+- File: rustbalance_node_hs/ob_config
+- Purpose: Enables Tor OnionBalance instance mode for v3 hidden service load balancing.
+- Required line:
+  MasterOnionAddress fvycds6c43757st42gov47msetzsic73x7qyo7skvwzuxwqury2otwyd.onion
+
+This file must exist in the HiddenServiceDir before Tor is configured with SETCONF HiddenServiceOnionbalanceInstance=1.
+
+See docs/CONFIG.md and CRYPTO_VALIDATION.md for details.
