@@ -323,6 +323,13 @@ configure_tor() {
         echo "CookieAuthentication 1" | sudo tee -a /etc/tor/torrc
     fi
     
+    # Enable FetchUselessDescriptors so we can read the consensus via control port
+    # Required for computing HSDir hash ring for targeted HSPOST
+    if ! grep -q "^FetchUselessDescriptors 1" /etc/tor/torrc; then
+        log "Adding FetchUselessDescriptors..."
+        echo "FetchUselessDescriptors 1" | sudo tee -a /etc/tor/torrc
+    fi
+    
     # Restart Tor (handles both tor and tor@default service styles)
     sudo systemctl restart tor@default 2>/dev/null || sudo systemctl restart tor
     sleep 3

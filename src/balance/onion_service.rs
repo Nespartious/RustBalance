@@ -178,6 +178,18 @@ impl OnionService {
             bail!("SETCONF failed: {}", response.trim());
         }
 
+        // Enable FetchUselessDescriptors so we can read the full consensus
+        // via GETINFO dir/status-vote/current/consensus for HSDir hash ring
+        let fetch_cmd = "SETCONF FetchUselessDescriptors=1\r\n";
+        stream.write_all(fetch_cmd.as_bytes()).await?;
+        let n = stream.read(&mut buf).await?;
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if response.starts_with("250") {
+            info!("Enabled FetchUselessDescriptors for consensus access");
+        } else {
+            warn!("Failed to set FetchUselessDescriptors: {}", response.trim());
+        }
+
         info!("Tor hidden service configured successfully");
         Ok(())
     }
