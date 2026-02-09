@@ -254,8 +254,32 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
     let mut current_ed25519: Option<[u8; 32]> = None;
     let mut is_hsdir = false;
 
+    // Diagnostic counters
+    let mut total_lines = 0u64;
+    let mut r_lines = 0u64;
+    let mut s_lines = 0u64;
+    let mut s_hsdir_lines = 0u64;
+    let mut id_ed25519_lines = 0u64;
+    let mut first_r_line: Option<String> = None;
+
     for line in consensus_text.lines() {
         let line = line.trim();
+        total_lines += 1;
+
+        // Diagnostic: track line types
+        if line.starts_with("r ") {
+            r_lines += 1;
+            if first_r_line.is_none() {
+                first_r_line = Some(line.chars().take(120).collect());
+            }
+        } else if line.starts_with("s ") {
+            s_lines += 1;
+            if line.split_whitespace().any(|f| f == "HSDir") {
+                s_hsdir_lines += 1;
+            }
+        } else if line.starts_with("id ed25519 ") {
+            id_ed25519_lines += 1;
+        }
 
         // Parse SRV lines from consensus header
         if line.starts_with("shared-rand-current-value ") {
@@ -340,6 +364,39 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
                 rsa_fingerprint: fp.clone(),
                 ed25519_identity: *ed25519,
             });
+        }
+    }
+
+    info!(
+        "Consensus parse stats: {} total lines, {} r-lines, {} s-lines, {} s-HSDir, {} id-ed25519, first_r={:?}",
+        total_lines,
+        r_lines,
+        s_lines,
+        s_hsdir_lines,
+        id_ed25519_lines,
+        first_r_line.as_deref().unwrap_or("(none)"),
+    );
+
+    // If we have r lines but 0 HSDir nodes, log why
+    if r_lines > 0 && hsdir_nodes.is_empty() {
+        info!(
+            "WARNING: Found {} routers but 0 HSDir nodes. Possible causes: s-HSDir={}, id-ed25519={}",
+            r_lines, s_hsdir_lines, id_ed25519_lines,
+        );
+    }
+
+    // If total_lines is low or r_lines is 0, show first 500 chars of consensus
+    if r_lines == 0 {
+        let preview: String = consensus_text.chars().take(500).collect();
+        info!("Consensus has 0 r-lines. First 500 chars: {:?}", preview);
+        // Also check for null bytes
+        let null_count = consensus_text.bytes().filter(|&b| b == 0).count();
+        if null_count > 0 {
+            info!(
+                "Consensus contains {} null bytes! First null at byte {}",
+                null_count,
+                consensus_text.bytes().position(|b| b == 0).unwrap_or(0),
+            );
         }
     }
 
