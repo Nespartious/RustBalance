@@ -113,11 +113,11 @@ impl TorController {
     async fn send_command(&mut self, cmd: &str) -> Result<String> {
         // Log the command being sent (truncate if long)
         let cmd_preview = if cmd.len() > 100 { &cmd[..100] } else { cmd };
-        tracing::info!("Sending Tor command: {}...", cmd_preview.trim());
+        tracing::debug!("Sending Tor command: {}...", cmd_preview.trim());
 
         self.stream.write_all(cmd.as_bytes()).await?;
         self.stream.flush().await?;
-        tracing::info!("Command sent and flushed, waiting for response...");
+        tracing::debug!("Command sent and flushed, waiting for response...");
 
         let mut reader = BufReader::new(&mut self.stream);
         let mut response = String::new();
@@ -152,7 +152,7 @@ impl TorController {
             );
 
             if bytes_read == 0 {
-                tracing::info!(
+                tracing::debug!(
                     "EOF reached after {} lines, breaking loop",
                     total_lines_read
                 );
@@ -182,7 +182,7 @@ impl TorController {
                         && line.len() >= 3
                         && line.chars().skip(1).take(2).all(|c| c.is_ascii_digit())))
             {
-                tracing::info!("Got final response line: {:?}", line.trim());
+                tracing::debug!("Got final response line: {:?}", line.trim());
                 // Don't include "250 OK" in the response data
                 if line.starts_with("5") {
                     response.push_str(&line);
@@ -205,7 +205,7 @@ impl TorController {
             bail!("Tor control error: {}", response.trim());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Command completed successfully, response len: {}",
             response.len()
         );

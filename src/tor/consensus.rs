@@ -10,6 +10,11 @@
 //! (previous SRV) — completely different HSDirs. Without targeted
 //! uploading, our merged descriptor is invisible to half the clients.
 //!
+//! The consensus document itself does NOT contain ed25519 relay identities.
+//! Ed25519 keys are stored in individual microdescriptors. This module
+//! fetches them via `GETINFO md/id/<fingerprint>` on the Tor control port,
+//! similar to how Onionbalance uses stem to join consensus + microdescriptor data.
+//!
 //! Reference: rend-spec-v3 section 2.2.6 [HASHRING]
 
 use anyhow::{bail, Result};
@@ -26,13 +31,30 @@ const HSDIR_SPREAD_STORE: usize = 4;
 /// Time period length in minutes (matching Tor's default)
 const TIME_PERIOD_LENGTH_MINUTES: u64 = 1440;
 
-/// An HSDir relay from the consensus
+/// An HSDir relay from the consensus (complete with ed25519)
 #[derive(Debug, Clone)]
 pub struct HsDirNode {
     /// RSA fingerprint in uppercase hex (40 chars), for HSPOST SERVER=
     pub rsa_fingerprint: String,
     /// Ed25519 identity key (32 bytes), for hash ring computation
     pub ed25519_identity: [u8; 32],
+}
+
+/// HSDir relay from consensus parsing (before ed25519 enrichment)
+#[derive(Debug, Clone)]
+struct PartialHsDirNode {
+    /// RSA fingerprint in uppercase hex (40 chars)
+    rsa_fingerprint: String,
+}
+
+/// Intermediate consensus data before ed25519 enrichment
+struct PartialConsensus {
+    /// Current SRV (shared-rand-current-value), 32 bytes
+    current_srv: [u8; 32],
+    /// Previous SRV (shared-rand-previous-value), 32 bytes
+    previous_srv: [u8; 32],
+    /// HSDir-flagged relays (RSA fingerprint only, no ed25519 yet)
+    hsdir_nodes: Vec<PartialHsDirNode>,
 }
 
 /// Parsed consensus data for HSDir computation
@@ -241,45 +263,21 @@ pub fn compute_responsible_hsdirs(
 /// Expects the raw text from `GETINFO dir/status-vote/current/consensus`.
 /// Extracts:
 /// - `shared-rand-current-value` and `shared-rand-previous-value`
-/// - All relays with the HSDir flag and an ed25519 identity key
-pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
+/// - All relays with the HSDir flag (RSA fingerprint only; ed25519 is NOT
+///   in the consensus — it comes from microdescriptors, fetched separately)
+fn parse_consensus(consensus_text: &str) -> Result<PartialConsensus> {
     let mut current_srv = [0u8; 32];
     let mut previous_srv = [0u8; 32];
     let mut has_current_srv = false;
     let mut has_previous_srv = false;
-    let mut hsdir_nodes: Vec<HsDirNode> = Vec::new();
+    let mut hsdir_nodes: Vec<PartialHsDirNode> = Vec::new();
 
     // Parser state for router entries
     let mut current_rsa_fp: Option<String> = None;
-    let mut current_ed25519: Option<[u8; 32]> = None;
     let mut is_hsdir = false;
-
-    // Diagnostic counters
-    let mut total_lines = 0u64;
-    let mut r_lines = 0u64;
-    let mut s_lines = 0u64;
-    let mut s_hsdir_lines = 0u64;
-    let mut id_ed25519_lines = 0u64;
-    let mut first_r_line: Option<String> = None;
 
     for line in consensus_text.lines() {
         let line = line.trim();
-        total_lines += 1;
-
-        // Diagnostic: track line types
-        if line.starts_with("r ") {
-            r_lines += 1;
-            if first_r_line.is_none() {
-                first_r_line = Some(line.chars().take(120).collect());
-            }
-        } else if line.starts_with("s ") {
-            s_lines += 1;
-            if line.split_whitespace().any(|f| f == "HSDir") {
-                s_hsdir_lines += 1;
-            }
-        } else if line.starts_with("id ed25519 ") {
-            id_ed25519_lines += 1;
-        }
 
         // Parse SRV lines from consensus header
         if line.starts_with("shared-rand-current-value ") {
@@ -307,18 +305,16 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
         // Router entry starts with "r "
         else if line.starts_with("r ") {
             // Save previous entry if it was a valid HSDir
-            if let (Some(ref fp), Some(ref ed25519)) = (&current_rsa_fp, &current_ed25519) {
+            if let Some(ref fp) = current_rsa_fp {
                 if is_hsdir {
-                    hsdir_nodes.push(HsDirNode {
+                    hsdir_nodes.push(PartialHsDirNode {
                         rsa_fingerprint: fp.clone(),
-                        ed25519_identity: *ed25519,
                     });
                 }
             }
 
             // Reset for new entry
             current_rsa_fp = None;
-            current_ed25519 = None;
             is_hsdir = false;
 
             // Parse RSA fingerprint from r line
@@ -336,21 +332,6 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
                 }
             }
         }
-        // Ed25519 identity key line
-        else if line.starts_with("id ed25519 ") {
-            let key_b64 = line.trim_start_matches("id ed25519 ").trim();
-            let mut padded = key_b64.to_string();
-            while padded.len() % 4 != 0 {
-                padded.push('=');
-            }
-            if let Ok(key_bytes) = STANDARD.decode(&padded) {
-                if key_bytes.len() == 32 {
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&key_bytes);
-                    current_ed25519 = Some(key);
-                }
-            }
-        }
         // Flags line
         else if line.starts_with("s ") {
             is_hsdir = line.split_whitespace().any(|f| f == "HSDir");
@@ -358,45 +339,11 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
     }
 
     // Don't forget the last entry
-    if let (Some(ref fp), Some(ref ed25519)) = (&current_rsa_fp, &current_ed25519) {
+    if let Some(ref fp) = current_rsa_fp {
         if is_hsdir {
-            hsdir_nodes.push(HsDirNode {
+            hsdir_nodes.push(PartialHsDirNode {
                 rsa_fingerprint: fp.clone(),
-                ed25519_identity: *ed25519,
             });
-        }
-    }
-
-    info!(
-        "Consensus parse stats: {} total lines, {} r-lines, {} s-lines, {} s-HSDir, {} id-ed25519, first_r={:?}",
-        total_lines,
-        r_lines,
-        s_lines,
-        s_hsdir_lines,
-        id_ed25519_lines,
-        first_r_line.as_deref().unwrap_or("(none)"),
-    );
-
-    // If we have r lines but 0 HSDir nodes, log why
-    if r_lines > 0 && hsdir_nodes.is_empty() {
-        info!(
-            "WARNING: Found {} routers but 0 HSDir nodes. Possible causes: s-HSDir={}, id-ed25519={}",
-            r_lines, s_hsdir_lines, id_ed25519_lines,
-        );
-    }
-
-    // If total_lines is low or r_lines is 0, show first 500 chars of consensus
-    if r_lines == 0 {
-        let preview: String = consensus_text.chars().take(500).collect();
-        info!("Consensus has 0 r-lines. First 500 chars: {:?}", preview);
-        // Also check for null bytes
-        let null_count = consensus_text.bytes().filter(|&b| b == 0).count();
-        if null_count > 0 {
-            info!(
-                "Consensus contains {} null bytes! First null at byte {}",
-                null_count,
-                consensus_text.bytes().position(|b| b == 0).unwrap_or(0),
-            );
         }
     }
 
@@ -409,13 +356,13 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
     }
 
     info!(
-        "Parsed consensus: {} HSDir nodes, current_srv={}..., previous_srv={}...",
+        "Parsed consensus: {} HSDir relays (RSA only), current_srv={}..., previous_srv={}...",
         hsdir_nodes.len(),
         hex::encode(&current_srv[..8]),
         hex::encode(&previous_srv[..8]),
     );
 
-    Ok(ConsensusData {
+    Ok(PartialConsensus {
         current_srv,
         previous_srv,
         hsdir_nodes,
@@ -425,6 +372,8 @@ pub fn parse_consensus(consensus_text: &str) -> Result<ConsensusData> {
 /// Fetch and parse the consensus from Tor's control port.
 ///
 /// Returns the parsed consensus data with HSDir nodes and SRV values.
+/// Ed25519 identities are fetched from microdescriptors via the control port
+/// since the consensus document itself does not contain them.
 pub async fn fetch_consensus(
     tor: &mut crate::tor::control::TorController,
 ) -> Result<ConsensusData> {
@@ -443,10 +392,6 @@ pub async fn fetch_consensus(
     let consensus_text = if let Some(pos) = raw.find("network-status-version") {
         &raw[pos..]
     } else {
-        info!(
-            "Consensus response first 200 chars: {:?}",
-            &raw[..std::cmp::min(200, raw.len())]
-        );
         &raw
     };
 
@@ -455,7 +400,118 @@ pub async fn fetch_consensus(
         raw.len(),
         consensus_text.len()
     );
-    parse_consensus(consensus_text)
+
+    let partial = parse_consensus(consensus_text)?;
+
+    // Now enrich HSDir nodes with ed25519 identities from microdescriptors.
+    // The consensus only has RSA fingerprints; ed25519 keys are in microdescriptors.
+    let total_nodes = partial.hsdir_nodes.len();
+    info!(
+        "Fetching ed25519 identities from microdescriptors for {} HSDir relays...",
+        total_nodes
+    );
+
+    let mut hsdir_nodes: Vec<HsDirNode> = Vec::with_capacity(total_nodes);
+    let mut fetched = 0usize;
+    let mut missing = 0usize;
+    let mut errors = 0usize;
+
+    for (i, node) in partial.hsdir_nodes.iter().enumerate() {
+        // Log progress every 500 nodes
+        if i > 0 && i % 500 == 0 {
+            info!(
+                "Ed25519 enrichment progress: {}/{} ({} found, {} missing, {} errors)",
+                i, total_nodes, fetched, missing, errors
+            );
+        }
+
+        match fetch_ed25519_from_microdesc(tor, &node.rsa_fingerprint).await {
+            Ok(Some(ed25519)) => {
+                hsdir_nodes.push(HsDirNode {
+                    rsa_fingerprint: node.rsa_fingerprint.clone(),
+                    ed25519_identity: ed25519,
+                });
+                fetched += 1;
+            },
+            Ok(None) => {
+                // Microdescriptor exists but has no ed25519 identity (very old relay)
+                debug!("No ed25519 in microdescriptor for {}", node.rsa_fingerprint);
+                missing += 1;
+            },
+            Err(e) => {
+                // Microdescriptor not cached or control port error
+                debug!(
+                    "Failed to fetch microdesc for {}: {}",
+                    node.rsa_fingerprint, e
+                );
+                errors += 1;
+            },
+        }
+    }
+
+    info!(
+        "Ed25519 enrichment complete: {} of {} HSDir relays have ed25519 ({} missing, {} errors)",
+        fetched, total_nodes, missing, errors
+    );
+
+    if hsdir_nodes.is_empty() && total_nodes > 0 {
+        bail!(
+            "Failed to get ed25519 identities for any of {} HSDir relays. \
+             Tor may not have cached microdescriptors yet.",
+            total_nodes
+        );
+    }
+
+    info!(
+        "Consensus ready: {} HSDir nodes with ed25519, current_srv={}..., previous_srv={}...",
+        hsdir_nodes.len(),
+        hex::encode(&partial.current_srv[..8]),
+        hex::encode(&partial.previous_srv[..8]),
+    );
+
+    Ok(ConsensusData {
+        current_srv: partial.current_srv,
+        previous_srv: partial.previous_srv,
+        hsdir_nodes,
+    })
+}
+
+/// Fetch a relay's ed25519 identity from its microdescriptor via the control port.
+///
+/// Uses `GETINFO md/id/<hex-fingerprint>` to retrieve the microdescriptor,
+/// then parses the `id ed25519 <base64>` line from it.
+///
+/// Returns:
+/// - `Ok(Some([u8; 32]))` if ed25519 identity was found
+/// - `Ok(None)` if microdescriptor exists but has no ed25519 line
+/// - `Err(...)` if microdescriptor is not cached or control port error
+async fn fetch_ed25519_from_microdesc(
+    tor: &mut crate::tor::control::TorController,
+    rsa_fingerprint: &str,
+) -> Result<Option<[u8; 32]>> {
+    let keyword = format!("md/id/{}", rsa_fingerprint);
+    let response = tor.get_info(&keyword).await?;
+
+    // Parse the microdescriptor text for `id ed25519 <base64>`
+    for line in response.lines() {
+        let line = line.trim();
+        if let Some(key_b64) = line.strip_prefix("id ed25519 ") {
+            let key_b64 = key_b64.trim();
+            let mut padded = key_b64.to_string();
+            while padded.len() % 4 != 0 {
+                padded.push('=');
+            }
+            if let Ok(key_bytes) = STANDARD.decode(&padded) {
+                if key_bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&key_bytes);
+                    return Ok(Some(key));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -501,23 +557,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_consensus_minimal() {
-        // Minimal consensus with 2 HSDir nodes
-        // Note: Base64 values must be canonical (zero trailing bits, correct length)
-        // 32 bytes = 43 base64 chars + "=" padding (44 total)
-        // 20 bytes (RSA identity) = 27 base64 chars (Tor omits "=" padding)
+    fn test_parse_consensus_extracts_hsdir_nodes() {
+        // Consensus with 2 HSDir relays and 1 non-HSDir relay
+        // Note: No `id ed25519` lines — ed25519 comes from microdescriptors, not consensus
         let consensus = "\
 network-status-version 3
 vote-status consensus
 shared-rand-previous-value 9 AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
 shared-rand-current-value 9 AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
 r relay1 AAAAAAAAAAAAAAAAAAAAAAAAAAA 2024-01-01 00:00:00 1.2.3.4 9001 0
-id ed25519 AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
 s Fast Guard HSDir Running Stable V2Dir Valid
 r relay2 BAQEBAQEBAQEBAQEBAQEBAQEBAQ 2024-01-01 00:00:00 5.6.7.8 9001 0
-id ed25519 AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
 s Fast HSDir Running Stable V2Dir Valid
-r relay3 BAQEBAQEBAQEBAQEBAQEBAQEBAQ 2024-01-01 00:00:00 9.10.11.12 9001 0
+r relay3 CAgICAgICAgICAgICAgICAgICAgI 2024-01-01 00:00:00 9.10.11.12 9001 0
 s Fast Running Stable
 ";
 
@@ -527,6 +579,9 @@ s Fast Running Stable
         // Third relay doesn't have HSDir flag, should not be included
         assert!(result.current_srv != [0u8; 32]);
         assert!(result.previous_srv != [0u8; 32]);
+        // Verify RSA fingerprints were extracted
+        assert!(!result.hsdir_nodes[0].rsa_fingerprint.is_empty());
+        assert!(!result.hsdir_nodes[1].rsa_fingerprint.is_empty());
     }
 
     #[test]
