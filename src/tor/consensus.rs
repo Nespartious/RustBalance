@@ -169,7 +169,12 @@ pub fn compute_responsible_hsdirs(
     // Sort by hsdir_index
     ring.sort_by(|a, b| a.0.cmp(&b.0));
 
-    debug!("Hash ring size: {} nodes", ring.len());
+    info!("Hash ring size: {} nodes", ring.len());
+
+    if ring.is_empty() {
+        info!("Hash ring is empty — no HSDir nodes found in consensus");
+        return Vec::new();
+    }
 
     let mut responsible: Vec<String> = Vec::new();
 
@@ -376,8 +381,24 @@ pub async fn fetch_consensus(
         );
     }
 
-    info!("Got consensus: {} bytes, parsing...", raw.len());
-    parse_consensus(&raw)
+    // Strip control protocol prefix: "250+dir/status-vote/current/consensus=\r\n"
+    // The GETINFO response includes this as the first line
+    let consensus_text = if let Some(pos) = raw.find("network-status-version") {
+        &raw[pos..]
+    } else {
+        info!(
+            "Consensus response first 200 chars: {:?}",
+            &raw[..std::cmp::min(200, raw.len())]
+        );
+        &raw
+    };
+
+    info!(
+        "Got consensus: {} bytes raw, {} bytes after prefix strip, parsing...",
+        raw.len(),
+        consensus_text.len()
+    );
+    parse_consensus(consensus_text)
 }
 
 #[cfg(test)]
